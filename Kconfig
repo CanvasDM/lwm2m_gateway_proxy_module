@@ -1,0 +1,90 @@
+#
+# Copyright (c) 2022 Laird Connectivity LLC
+#
+# SPDX-License-Identifier: LicenseRef-LairdConnectivity-Clause
+#
+menuconfig LCZ_LWM2M_GATEWAY_PROXY
+	bool "LCZ LwM2M Gateway Proxy Support"
+	depends on LCZ_LWM2M_CLIENT
+	depends on LCZ_LWM2M_GATEWAY_OBJ
+	depends on LCZ_BLE_GW_DM
+	depends on LCZ_BT
+	depends on LCZ_BT_SCAN
+	depends on LCZ_AD_FIND
+	depends on LCZ_SENSOR_ADV_FORMAT
+	depends on LCZ_SENSOR_ADV_MATCH
+	depends on BT_CENTRAL
+	depends on BT_DFU_SMP
+	depends on BT_GATT_DM
+	depends on BT_SMP
+	depends on BT_USER_DATA_LEN_UPDATE
+
+if LCZ_LWM2M_GATEWAY_PROXY
+
+module=LCZ_LWM2M_GATEWAY_PROXY
+module-str=LCZ_LWM2M_GATEWAY_PROXY
+source "subsys/logging/Kconfig.template.log_config"
+
+config LCZ_LWM2M_GATEWAY_PROXY_INIT_PRIORITY
+	int "Init application priority for LwM2M gateway proxy"
+	range 0 99
+	default APPLICATION_INIT_PRIORITY
+
+config LCZ_LWM2M_GATEWAY_PROXY_NUM_CONTEXTS
+	int "Number of simultaneous proxy client connections"
+	range 1 BT_MAX_CONN
+	default 1
+
+config LCZ_LWM2M_GATEWAY_PROXY_TIMEOUT_OUTGOING_SECONDS
+	int "Timeout for outgoing proxy connections"
+	default 15
+
+config LCZ_LWM2M_GATEWAY_PROXY_TIMEOUT_INCOMING_SECONDS
+	int "Timeout for incoming proxy connections"
+	default 20
+
+config LCZ_LWM2M_GATEWAY_PROXY_MIN_CLIENT_LIFETIME_SECONDS
+	int "Minimum proxy client registration lifetime"
+	default 300
+
+config LCZ_LWM2M_GATEWAY_PROXY_MAX_CLIENT_LIFETIME_SECONDS
+	int "Maximum proxy client registration lifetime"
+	default 3600
+
+config LCZ_LWM2M_GATEWAY_PROXY_BLOCKLIST_TIME_SECONDS
+	int "Block list time for client claimed by another gateway"
+	default 1800
+
+config LCZ_LWM2M_GATEWAY_PROXY_COAP_FILE
+	bool "LCZ Gateway CoAP File Proxy Support"
+	depends on LCZ_LWM2M_FIRMWARE_UPDATE_PULL_COAP_PROXY_SUPPORT
+	depends on FILE_SYSTEM_UTILITIES
+
+if LCZ_LWM2M_GATEWAY_PROXY_COAP_FILE
+
+config LCZ_LWM2M_GATEWAY_PROXY_COAP_FILE_TLS_TAG
+	int "TLS tag to use for file proxy connection"
+	default 0
+	range 0 65535
+
+config LCZ_LWM2M_GATEWAY_PROXY_COAP_FILE_DIRECTORY
+	string "Directory to store cached files"
+	default "pcache"
+	help
+	  The directory here is located at the root of the partition given by LCZ_PARAM_FILE_MOUNT_POINT
+
+config LCZ_LWM2M_GATEWAY_PROXY_COAP_FILE_NUM
+	int "Number of files cached by the proxy"
+	default 4
+
+config LCZ_LWM2M_GATEWAY_FILE_PROXY_CACHE_LIFETIME_SECONDS
+	int "Time to keep proxy files in cache"
+	default 1800
+
+config LCZ_LWM2M_GATEWAY_FILE_PROXY_TIMEOUT_SECONDS
+	int "Timeout for outgoing file proxy connections"
+	default 15
+
+endif # LCZ_LWM2M_GATEWAY_PROXY_COAP_FILES
+
+endif # LCZ_LWM2M_GATEWAY_PROXY
