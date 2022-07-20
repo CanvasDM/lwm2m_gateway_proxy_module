@@ -1114,6 +1114,10 @@ static void bt_security_changed(struct bt_conn *conn, bt_security_t level, enum 
 			}
 		} else {
 			LOG_ERR("bt_security_changed: fail with level %d err %d", level, err);
+
+			/* Try unpairing this device if this happens */
+			(void)bt_unpair(BT_ID_DEFAULT, bt_conn_get_dst(conn));
+
 			if (pctx->ctx.fault_cb != NULL) {
 				pctx->ctx.fault_cb(&(pctx->ctx), err);
 			}
