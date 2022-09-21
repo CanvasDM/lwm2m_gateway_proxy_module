@@ -35,20 +35,24 @@ extern "C" {
 #define CTX_FLAG_INCOMING 0x02
 #define CTX_FLAG_CLIENT_SECURE 0x04
 #define CTX_FLAG_CLIENT_DISCOVER 0x08
-#define CTX_FLAG_CLIENT_TUNNEL_OPEN (CTX_FLAG_CLIENT_SECURE | CTX_FLAG_CLIENT_DISCOVER)
-#define CTX_FLAG_CLIENT_TUNNEL_BUSY 0x10
-#define CTX_FLAG_STOPPED 0x20
+#define CTX_FLAG_CLIENT_AUTHORIZED 0x10
+#define CTX_FLAG_CLIENT_TUNNEL_OPEN 0x20
+#define CTX_FLAG_CLIENT_TUNNEL_BUSY 0x40
+#define CTX_FLAG_STOPPED 0x80
 
-/* Buffer for response */
+/* Buffer for SMP messages */
 struct lwm2m_gw_smp_buffer {
 	struct bt_dfu_smp_header header;
-	uint8_t payload[LCZ_COAP_MGMT_MAX_COAP_PACKET_SIZE];
+	uint8_t payload[1];
 };
 
 /** @brief Data strorage for proxy device information */
 typedef struct {
 	/* SMP transport tunnel ID */
 	uint32_t tunnel_id;
+
+	/* Count of repeated connection failures */
+	uint32_t failure_count;
 
 	/* Queue of pending CoAP messages to device */
 	struct k_fifo tx_queue;
@@ -69,8 +73,10 @@ typedef struct {
 	struct k_fifo tx_queue;
 	struct k_fifo rx_queue;
 	struct bt_dfu_smp smp_client;
-	struct lwm2m_gw_smp_buffer smp_rsp_buff;
 	struct bt_conn *active_conn;
+
+	/* Buffer to hold SMP messages (replies and notifications) to be re-assembled */
+	struct lwm2m_gw_smp_buffer *smp_rsp_buff;
 
 	/* Pending messages from the device */
 	struct coap_pending pendings[CONFIG_LCZ_LWM2M_ENGINE_MAX_PENDING];
@@ -102,6 +108,16 @@ void lcz_lwm2m_gateway_proxy_device_ready(const bt_addr_le_t *addr);
  * one that we know about.
  */
 LCZ_LWM2M_GATEWAY_PROXY_CTX_T *lcz_lwm2m_gateway_proxy_conn_to_context(struct bt_conn *conn);
+
+/**
+ * @brief Look up a proxy context given a BLE address
+ *
+ * @param[in] addr BLE address
+ *
+ * @returns a pointer to the context or NULL if the connection isn't
+ * one that we know about.
+ */
+LCZ_LWM2M_GATEWAY_PROXY_CTX_T *lcz_lwm2m_gateway_proxy_addr_to_context(const bt_addr_le_t *addr);
 
 /**
  * @brief Close a proxy context

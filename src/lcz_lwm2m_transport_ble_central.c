@@ -33,6 +33,7 @@ LOG_MODULE_REGISTER(lcz_lwm2m_ble_central, CONFIG_LCZ_LWM2M_CLIENT_LOG_LEVEL);
 #include <zcbor_common.h>
 #include <zcbor_encode.h>
 #include <zcbor_decode.h>
+#include <zcbor_bulk/zcbor_bulk_priv.h>
 #include <lcz_lwm2m.h>
 
 #include "lcz_bluetooth.h"
@@ -40,6 +41,14 @@ LOG_MODULE_REGISTER(lcz_lwm2m_ble_central, CONFIG_LCZ_LWM2M_CLIENT_LOG_LEVEL);
 #include "lcz_lwm2m_gateway_obj.h"
 #include "lcz_lwm2m_gateway_proxy_scan.h"
 #include "lcz_lwm2m_gateway_proxy.h"
+
+#if defined(CONFIG_ATTR)
+#include "attr.h"
+#endif
+
+#if defined(CONFIG_LCZ_PKI_AUTH_SMP_CENTRAL)
+#include "lcz_pki_auth_smp.h"
+#endif
 
 /**************************************************************************************************/
 /* Local Constant, Macro and Type Definitions                                                     */
@@ -75,6 +84,7 @@ static char *lwm2m_transport_ble_central_print_addr(struct lwm2m_ctx *client_ctx
 						    const struct sockaddr *addr);
 
 static void smp_client_send_work_function(struct k_work *w);
+static void smp_client_send_open_tunnel(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx);
 static void smp_client_resp_handler(struct bt_dfu_smp *dfu_smp);
 static void dfu_smp_on_error(struct bt_dfu_smp *dfu_smp, int err);
 
@@ -92,6 +102,8 @@ static void bt_security_changed(struct bt_conn *conn, bt_security_t level,
 static void discovery_completed_cb(struct bt_gatt_dm *dm, void *context);
 static void discovery_service_not_found_cb(struct bt_conn *conn, void *context);
 static void discovery_error_found_cb(struct bt_conn *conn, int err, void *context);
+
+static void auth_complete_cb(const bt_addr_le_t *addr, bool status);
 
 /**************************************************************************************************/
 /* Local Data Definitions                                                                         */
@@ -126,6 +138,12 @@ static const struct bt_dfu_smp_init_params dfu_init_params = {
 
 static const struct bt_gatt_exchange_params exchange_params = { .func = exchange_func };
 
+#if defined(CONFIG_LCZ_PKI_AUTH_SMP_CENTRAL)
+static struct lcz_pki_auth_smp_central_auth_callback_agent auth_cb_agent = {
+	.cb = auth_complete_cb
+};
+#endif
+
 /**************************************************************************************************/
 /* Local Function Definitions                                                                     */
 /**************************************************************************************************/
@@ -148,6 +166,60 @@ static void eventfd_close(int fd)
 		efd_vtable->close(obj);
 		z_free_fd(fd);
 		k_mutex_unlock(lock);
+	}
+}
+
+/** @brief Report an error for a device
+ *
+ * @param[in] pctx Proxy context for the device
+ * @param[in] immed_block True if the device should be block immediately
+ */
+static void dev_error(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx, bool immed_block)
+{
+	LCZ_LWM2M_GATEWAY_PROXY_DEV_T *pdev;
+
+	/* Get the device-specific data */
+	pdev = lcz_lwm2m_gw_obj_get_dm_data(pctx->dev_idx);
+
+	if (pdev != NULL) {
+		/* Increment the count of failures */
+		if (pdev->failure_count < CONFIG_LCZ_LWM2M_GATEWAY_PROXY_MAX_FAILURE_COUNT) {
+			pdev->failure_count++;
+		}
+
+		/* If the count exceeds the limit, block the device */
+		if (pdev->failure_count >= CONFIG_LCZ_LWM2M_GATEWAY_PROXY_MAX_FAILURE_COUNT) {
+			immed_block = true;
+		}
+
+		/* If we're going to block the device, clear the failure count now */
+		if (immed_block) {
+			pdev->failure_count = 0;
+		}
+	}
+
+	/* Block the device if needed */
+	if (immed_block) {
+		LOG_WRN("Adding device to temporary block list");
+		lcz_lwm2m_gw_obj_add_blocklist(
+			pctx->dev_idx, CONFIG_LCZ_LWM2M_GATEWAY_PROXY_BLOCKLIST_TIME_SECONDS);
+	}
+}
+
+/** @brief Report a successful exchange for a device
+ *
+ * @param[in] pctx Proxy context for the device
+ */
+static void dev_success(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx)
+{
+	LCZ_LWM2M_GATEWAY_PROXY_DEV_T *pdev;
+
+	/* Get the device-specific data */
+	pdev = lcz_lwm2m_gw_obj_get_dm_data(pctx->dev_idx);
+
+	/* Clear the failure count */
+	if (pdev != NULL) {
+		pdev->failure_count = 0;
 	}
 }
 
@@ -192,6 +264,9 @@ static int lwm2m_transport_ble_central_start(struct lwm2m_ctx *client_ctx)
 		LOG_ERR("Create connection failed: %d", err);
 		pctx->active_conn = NULL;
 
+		/* Report the error */
+		dev_error(pctx, false);
+
 		/* Resume scanning */
 		lcz_lwm2m_gateway_proxy_scan_resume();
 		return err;
@@ -200,9 +275,14 @@ static int lwm2m_transport_ble_central_start(struct lwm2m_ctx *client_ctx)
 		client_ctx->sock_fd = eventfd(0, EFD_NONBLOCK);
 		if (client_ctx->sock_fd < 0) {
 			LOG_ERR("Failed to create eventfd socket: %d", client_ctx->sock_fd);
+
 			bt_conn_disconnect(pctx->active_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
 			bt_conn_unref(pctx->active_conn);
 			pctx->active_conn = NULL;
+
+			/* Report the error */
+			dev_error(pctx, false);
+
 			return client_ctx->sock_fd;
 		} else {
 			return 0;
@@ -423,39 +503,39 @@ static char *lwm2m_transport_ble_central_print_addr(struct lwm2m_ctx *client_ctx
 	return lcz_lwm2m_gw_obj_get_addr_string(pctx->dev_idx);
 }
 
-/** @brief Work handler for transmitting packets over the tunnel
- *
- * This function removes one item from the context's tunnel transmit queue,
- * encodes a CBOR and SMP message to tunnel that data to the peripheral,
- * and sends it.
- *
- * @param[in] w Work item pointer
- */
-static void smp_client_send_work_function(struct k_work *w)
+static int build_tunnel_data(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx,
+			     LCZ_LWM2M_GATEWAY_PROXY_DEV_T *pdev, struct queue_entry_t *item)
 {
-	LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx =
-		CONTAINER_OF(w, LCZ_LWM2M_GATEWAY_PROXY_CTX_T, tunnel_tx_work);
-	LCZ_LWM2M_GATEWAY_PROXY_DEV_T *pdev;
 	zcbor_state_t zs[CONFIG_MGMT_MAX_DECODING_LEVELS + 2];
 	struct zcbor_string zstr;
 	bool ok;
 	int err = 0;
-	struct queue_entry_t *item;
-	struct lwm2m_gw_smp_buffer smp_buf;
+	struct lwm2m_gw_smp_buffer *smp_buf = NULL;
+	size_t out_buffer_size;
 	uint16_t payload_len;
 
-	/* Acquire a mutex lock for our data */
-	k_mutex_lock(&(pctx->lock), K_FOREVER);
+	/* Calculate the size of the output buffer needed */
+	out_buffer_size =
+		sizeof(struct bt_dfu_smp_header) + LCZ_COAP_TUNNEL_CBOR_OVERHEAD + item->length;
+	if (out_buffer_size > CONFIG_LCZ_LWM2M_TRANSPORT_BLE_MAX_PACKET) {
+		LOG_ERR("build_tunnel_data: packet too large: %d", item->length);
+		err = -EMSGSIZE;
+	}
 
-	/* Get the device-specific data */
-	pdev = lcz_lwm2m_gw_obj_get_dm_data(pctx->dev_idx);
+	/* Allocate memory for the message */
+	if (err == 0) {
+		smp_buf = (struct lwm2m_gw_smp_buffer *)k_malloc(out_buffer_size);
+		if (smp_buf == NULL) {
+			LOG_ERR("build_tunnel_data: failed to allocate %d bytes", out_buffer_size);
+			err = -ENOMEM;
+		}
+	}
 
-	/* Remove the first item from the transmit queue */
-	item = k_fifo_get(&(pctx->tx_queue), K_NO_WAIT);
-	if (item != NULL) {
-		/* Build the CBOR message */
-		zcbor_new_state(zs, sizeof(zs) / sizeof(zs[0]), smp_buf.payload,
-				sizeof(smp_buf.payload), 1);
+	/* Build the CBOR message */
+	if (err == 0) {
+		zcbor_new_state(zs, sizeof(zs) / sizeof(zs[0]), smp_buf->payload,
+				(out_buffer_size - sizeof(struct bt_dfu_smp_header)), 1);
+
 		ok = zcbor_map_start_encode(zs, 1);
 		if (ok) {
 			zstr.len = strlen(LCZ_COAP_CBOR_KEY_TUNNEL_ID);
@@ -478,42 +558,250 @@ static void smp_client_send_work_function(struct k_work *w)
 		if (ok) {
 			ok = zcbor_map_end_encode(zs, 1);
 		}
-
-		payload_len = (size_t)(zs[0].payload - smp_buf.payload);
-
-		/* Fill in SMP message header */
-		smp_buf.header.op = MGMT_OP_WRITE;
-		smp_buf.header.flags = 0;
-		smp_buf.header.len_h8 = (uint8_t)((payload_len >> 8) & 0xFF);
-		smp_buf.header.len_l8 = (uint8_t)((payload_len >> 0) & 0xFF);
-		smp_buf.header.group_h8 =
-			(uint8_t)((CONFIG_LCZ_LWM2M_TRANSPORT_BLE_SMP_GROUP >> 8) & 0xFF);
-		smp_buf.header.group_l8 =
-			(uint8_t)((CONFIG_LCZ_LWM2M_TRANSPORT_BLE_SMP_GROUP >> 0) & 0xFF);
-		smp_buf.header.seq = 0;
-		smp_buf.header.id = LCZ_COAP_MGMT_ID_TUNNEL_DATA;
-
-		if (ok) {
-			err = bt_dfu_smp_command(&(pctx->smp_client), smp_client_resp_handler,
-						 sizeof(smp_buf.header) + payload_len, &smp_buf);
-			if (err == 0) {
-				pctx->flags |= CTX_FLAG_CLIENT_TUNNEL_BUSY;
-			} else {
-				LOG_ERR("Failed to send tunnel data message: %d", err);
-			}
-		} else {
-			LOG_ERR("Failed to encode tunnel data message");
+		if (ok == false) {
+			LOG_ERR("build_tunnel_data: failed to encode CBOR");
 			err = -ENOMEM;
 		}
+	}
 
-		/* Free the queue item memory */
-		k_free(item);
+	if (err == 0) {
+		payload_len = (size_t)(zs[0].payload - smp_buf->payload);
+
+		/* Fill in SMP message header */
+		smp_buf->header.op = MGMT_OP_WRITE;
+		smp_buf->header.flags = 0;
+		smp_buf->header.len_h8 = (uint8_t)((payload_len >> 8) & 0xFF);
+		smp_buf->header.len_l8 = (uint8_t)((payload_len >> 0) & 0xFF);
+		smp_buf->header.group_h8 =
+			(uint8_t)((CONFIG_LCZ_LWM2M_TRANSPORT_BLE_SMP_GROUP >> 8) & 0xFF);
+		smp_buf->header.group_l8 =
+			(uint8_t)((CONFIG_LCZ_LWM2M_TRANSPORT_BLE_SMP_GROUP >> 0) & 0xFF);
+		smp_buf->header.seq = 0;
+		smp_buf->header.id = LCZ_COAP_MGMT_ID_TUNNEL_DATA;
+
+		err = bt_dfu_smp_command(&(pctx->smp_client), smp_client_resp_handler,
+					 sizeof(smp_buf->header) + payload_len, smp_buf);
+		if (err == 0) {
+			pctx->flags |= CTX_FLAG_CLIENT_TUNNEL_BUSY;
+		} else {
+			LOG_ERR("build_tunnel_data: Failed to send tunnel data message: %d", err);
+		}
+	}
+
+	/* Free any memory that we allocated */
+	if (smp_buf != NULL) {
+		k_free(smp_buf);
+	}
+
+	return err;
+}
+
+#if defined(CONFIG_LCZ_PKI_AUTH_SMP_CENTRAL)
+static int build_tunnel_enc_data(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx,
+				 LCZ_LWM2M_GATEWAY_PROXY_DEV_T *pdev, struct queue_entry_t *item,
+				 psa_key_id_t enc_key, psa_key_id_t sig_key)
+{
+	zcbor_state_t zs[CONFIG_MGMT_MAX_DECODING_LEVELS + 2];
+	struct zcbor_string zstr;
+	bool ok;
+	int err = 0;
+	struct lwm2m_gw_smp_buffer *smp_buf = NULL;
+	uint16_t payload_len;
+	size_t nonce_len;
+	size_t ciphertext_size;
+	size_t out_buffer_size;
+	size_t ciphertext_out_size;
+	uint8_t *ciphertext = NULL;
+
+	/* Calculate the size of the encrypted output */
+	nonce_len = PSA_AEAD_NONCE_LENGTH(LCZ_PKI_AUTH_SMP_SESSION_KEY_TYPE,
+					  LCZ_PKI_AUTH_SMP_SESSION_ENC_KEY_ALG);
+	ciphertext_size =
+		nonce_len + PSA_AEAD_ENCRYPT_OUTPUT_SIZE(LCZ_PKI_AUTH_SMP_SESSION_KEY_TYPE,
+							 LCZ_PKI_AUTH_SMP_SESSION_ENC_KEY_ALG,
+							 item->length);
+
+	/*
+	 * Calculate the size of the output buffer needed
+	 *
+	 * The output buffer is the SMP header, some overhead for CBOR encoding, and the size
+	 * of the ciphertext.
+	 */
+	out_buffer_size =
+		sizeof(struct bt_dfu_smp_header) + LCZ_COAP_TUNNEL_CBOR_OVERHEAD + ciphertext_size;
+	if (out_buffer_size > CONFIG_LCZ_LWM2M_TRANSPORT_BLE_MAX_PACKET) {
+		LOG_ERR("build_tunnel_enc_data: packet too large: %d", item->length);
+		err = -EMSGSIZE;
+	}
+
+	/* Allocate memory for the message */
+	if (err == 0) {
+		smp_buf = (struct lwm2m_gw_smp_buffer *)k_malloc(out_buffer_size);
+		if (smp_buf == NULL) {
+			LOG_ERR("build_tunnel_enc_data: failed to allocate %d bytes",
+				out_buffer_size);
+			err = -ENOMEM;
+		}
+	}
+
+	/* Allocate memory for the ciphertext */
+	if (err == 0) {
+		ciphertext = (uint8_t *)k_malloc(ciphertext_size);
+		if (ciphertext == NULL) {
+			LOG_ERR("build_tunnel_enc_data: failed to allocate ciphertext buffer of %d bytes",
+				ciphertext_size);
+			err = -ENOMEM;
+		}
+	}
+
+	/* Generate the nonce */
+	if (err == 0) {
+		err = psa_generate_random(ciphertext, nonce_len);
+		if (err != PSA_SUCCESS) {
+			LOG_ERR("build_tunnel_enc_data: generate random nonce failed: %d", err);
+		}
+	}
+
+	/* Encrypt the data */
+	if (err == 0) {
+		err = psa_aead_encrypt(enc_key, LCZ_PKI_AUTH_SMP_SESSION_ENC_KEY_ALG, ciphertext,
+				       nonce_len, (uint8_t *)&(pdev->tunnel_id),
+				       sizeof(pdev->tunnel_id), item->data, item->length,
+				       ciphertext + nonce_len, ciphertext_size - nonce_len,
+				       &ciphertext_out_size);
+		if (err != PSA_SUCCESS) {
+			LOG_ERR("build_tunnel_enc_data: failed to encrypt: %d", err);
+		}
+	}
+
+	/* Build the CBOR message */
+	if (err == 0) {
+		zcbor_new_state(zs, sizeof(zs) / sizeof(zs[0]), smp_buf->payload,
+				(out_buffer_size - sizeof(struct bt_dfu_smp_header)), 1);
+		ok = zcbor_map_start_encode(zs, 1);
+		if (ok) {
+			zstr.len = strlen(LCZ_COAP_CBOR_KEY_TUNNEL_ID);
+			zstr.value = LCZ_COAP_CBOR_KEY_TUNNEL_ID;
+			ok = zcbor_tstr_encode(zs, &zstr);
+		}
+		if (ok) {
+			ok = zcbor_uint32_encode(zs, &(pdev->tunnel_id));
+		}
+		if (ok) {
+			zstr.len = strlen(LCZ_COAP_CBOR_KEY_DATA);
+			zstr.value = LCZ_COAP_CBOR_KEY_DATA;
+			ok = zcbor_tstr_encode(zs, &zstr);
+		}
+		if (ok) {
+			zstr.len = ciphertext_size;
+			zstr.value = ciphertext;
+			ok = zcbor_bstr_encode(zs, &zstr);
+		}
+		if (ok) {
+			ok = zcbor_map_end_encode(zs, 1);
+		}
+		if (ok == false) {
+			LOG_ERR("build_tunnel_enc_data: failed to encode CBOR");
+			err = -ENOMEM;
+		}
+	}
+
+	if (err == 0) {
+		payload_len = (size_t)(zs[0].payload - smp_buf->payload);
+
+		/* Fill in SMP message header */
+		smp_buf->header.op = MGMT_OP_WRITE;
+		smp_buf->header.flags = 0;
+		smp_buf->header.len_h8 = (uint8_t)((payload_len >> 8) & 0xFF);
+		smp_buf->header.len_l8 = (uint8_t)((payload_len >> 0) & 0xFF);
+		smp_buf->header.group_h8 =
+			(uint8_t)((CONFIG_LCZ_LWM2M_TRANSPORT_BLE_SMP_GROUP >> 8) & 0xFF);
+		smp_buf->header.group_l8 =
+			(uint8_t)((CONFIG_LCZ_LWM2M_TRANSPORT_BLE_SMP_GROUP >> 0) & 0xFF);
+		smp_buf->header.seq = 0;
+		smp_buf->header.id = LCZ_COAP_MGMT_ID_TUNNEL_ENC_DATA;
+
+		err = bt_dfu_smp_command(&(pctx->smp_client), smp_client_resp_handler,
+					 sizeof(smp_buf->header) + payload_len, smp_buf);
+		if (err == 0) {
+			pctx->flags |= CTX_FLAG_CLIENT_TUNNEL_BUSY;
+		} else {
+			LOG_ERR("Failed to send tunnel encrypted data message: %d", err);
+		}
+	}
+
+	/* Free the memory that we allocated */
+	if (ciphertext != NULL) {
+		k_free(ciphertext);
+	}
+	if (smp_buf != NULL) {
+		k_free(smp_buf);
+	}
+
+	return err;
+}
+#endif
+
+/** @brief Work handler for transmitting packets over the tunnel
+ *
+ * This function removes one item from the context's tunnel transmit queue,
+ * encodes a CBOR and SMP message to tunnel that data to the peripheral,
+ * and sends it.
+ *
+ * @param[in] w Work item pointer
+ */
+static void smp_client_send_work_function(struct k_work *w)
+{
+	LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx =
+		CONTAINER_OF(w, LCZ_LWM2M_GATEWAY_PROXY_CTX_T, tunnel_tx_work);
+	LCZ_LWM2M_GATEWAY_PROXY_DEV_T *pdev;
+	int err = 0;
+	struct queue_entry_t *item;
+#if defined(CONFIG_LCZ_PKI_AUTH_SMP_CENTRAL)
+	psa_key_id_t enc_key = PSA_KEY_HANDLE_INIT;
+	psa_key_id_t sig_key = PSA_KEY_HANDLE_INIT;
+#endif
+
+	/* Acquire a mutex lock for our data */
+	k_mutex_lock(&(pctx->lock), K_FOREVER);
+
+	/* Get the device-specific data */
+	pdev = lcz_lwm2m_gw_obj_get_dm_data(pctx->dev_idx);
+
+	if ((pctx->flags & CTX_FLAG_CLIENT_TUNNEL_OPEN) == 0) {
+		smp_client_send_open_tunnel(pctx);
+	} else {
+		/* Remove the first item from the transmit queue */
+		item = k_fifo_get(&(pctx->tx_queue), K_NO_WAIT);
+		if (item != NULL) {
+#if defined(CONFIG_LCZ_PKI_AUTH_SMP_CENTRAL)
+			if ((pctx->flags & CTX_FLAG_CLIENT_AUTHORIZED) != 0) {
+				err = lcz_pki_auth_smp_central_get_keys(
+					bt_conn_get_dst(pctx->active_conn), &enc_key, &sig_key);
+				if (err == 0) {
+					err = build_tunnel_enc_data(pctx, pdev, item, enc_key,
+								    sig_key);
+				} else {
+					LOG_ERR("Could not retrieve session keys: %d", err);
+				}
+			} else
+#endif
+			{
+				err = build_tunnel_data(pctx, pdev, item);
+			}
+
+			/* Free the queue item memory */
+			k_free(item);
+		}
 	}
 
 	/* Release the mutex lock for our data */
 	k_mutex_unlock(&(pctx->lock));
 
 	if (err) {
+		/* Report the error */
+		dev_error(pctx, false);
+
 		if (pctx->ctx.fault_cb != NULL) {
 			pctx->ctx.fault_cb(&(pctx->ctx), err);
 		}
@@ -534,8 +822,17 @@ static void smp_client_send_open_tunnel(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx)
 	struct zcbor_string zstr;
 	bool ok;
 	int err = 0;
-	struct lwm2m_gw_smp_buffer smp_buf;
+	struct lwm2m_gw_smp_buffer *smp_buf = NULL;
 	uint16_t payload_len;
+	size_t buffer_size;
+
+	/* Allocate memory for the message */
+	buffer_size = sizeof(struct bt_dfu_smp_header) + LCZ_COAP_TUNNEL_CBOR_OVERHEAD;
+	smp_buf = (struct lwm2m_gw_smp_buffer *)k_malloc(buffer_size);
+	if (smp_buf == NULL) {
+		LOG_ERR("smp_client_send_open_tunnel: alloc failed");
+		return;
+	}
 
 	/* Acquire a mutex lock for our data */
 	k_mutex_lock(&(pctx->lock), K_FOREVER);
@@ -544,8 +841,8 @@ static void smp_client_send_open_tunnel(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx)
 	pdev = lcz_lwm2m_gw_obj_get_dm_data(pctx->dev_idx);
 
 	/* Build the CBOR message */
-	zcbor_new_state(zs, sizeof(zs) / sizeof(zs[0]), smp_buf.payload, sizeof(smp_buf.payload),
-			1);
+	zcbor_new_state(zs, sizeof(zs) / sizeof(zs[0]), smp_buf->payload,
+			LCZ_COAP_TUNNEL_CBOR_OVERHEAD, 1);
 	ok = zcbor_map_start_encode(zs, 1);
 	if (ok) {
 		zstr.len = strlen(LCZ_COAP_CBOR_KEY_TUNNEL_ID);
@@ -559,21 +856,23 @@ static void smp_client_send_open_tunnel(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx)
 		ok = zcbor_map_end_encode(zs, 1);
 	}
 
-	payload_len = (size_t)(zs[0].payload - smp_buf.payload);
+	payload_len = (size_t)(zs[0].payload - smp_buf->payload);
 
 	/* Fill in SMP message header */
-	smp_buf.header.op = MGMT_OP_WRITE;
-	smp_buf.header.flags = 0;
-	smp_buf.header.len_h8 = (uint8_t)((payload_len >> 8) & 0xFF);
-	smp_buf.header.len_l8 = (uint8_t)((payload_len >> 0) & 0xFF);
-	smp_buf.header.group_h8 = (uint8_t)((CONFIG_LCZ_LWM2M_TRANSPORT_BLE_SMP_GROUP >> 8) & 0xFF);
-	smp_buf.header.group_l8 = (uint8_t)((CONFIG_LCZ_LWM2M_TRANSPORT_BLE_SMP_GROUP >> 0) & 0xFF);
-	smp_buf.header.seq = 0;
-	smp_buf.header.id = LCZ_COAP_MGMT_ID_OPEN_TUNNEL;
+	smp_buf->header.op = MGMT_OP_WRITE;
+	smp_buf->header.flags = 0;
+	smp_buf->header.len_h8 = (uint8_t)((payload_len >> 8) & 0xFF);
+	smp_buf->header.len_l8 = (uint8_t)((payload_len >> 0) & 0xFF);
+	smp_buf->header.group_h8 =
+		(uint8_t)((CONFIG_LCZ_LWM2M_TRANSPORT_BLE_SMP_GROUP >> 8) & 0xFF);
+	smp_buf->header.group_l8 =
+		(uint8_t)((CONFIG_LCZ_LWM2M_TRANSPORT_BLE_SMP_GROUP >> 0) & 0xFF);
+	smp_buf->header.seq = 0;
+	smp_buf->header.id = LCZ_COAP_MGMT_ID_OPEN_TUNNEL;
 
 	if (ok) {
 		err = bt_dfu_smp_command(&(pctx->smp_client), smp_client_resp_handler,
-					 sizeof(smp_buf.header) + payload_len, &smp_buf);
+					 sizeof(smp_buf->header) + payload_len, smp_buf);
 		if (err == 0) {
 			pctx->flags |= CTX_FLAG_CLIENT_TUNNEL_BUSY;
 		} else {
@@ -582,6 +881,10 @@ static void smp_client_send_open_tunnel(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx)
 	} else {
 		LOG_ERR("Failed to encode open tunnel message");
 		err = -ENOMEM;
+	}
+
+	if (smp_buf != NULL) {
+		k_free(smp_buf);
 	}
 
 	/* Release the mutex lock for our data */
@@ -605,17 +908,22 @@ static int handle_open_tunnel_resp(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx, zcbor_st
 {
 	LCZ_LWM2M_GATEWAY_PROXY_DEV_T *pdev;
 	uint32_t tunnel_id = 0;
-	struct zcbor_string key;
 	int rc = 0;
+	bool ok;
+	size_t decoded;
 
-	/* Decode the CBOR payload */
-	if (zcbor_map_start_decode(zsd) == false || zcbor_tstr_decode(zsd, &key) == false ||
-	    key.len != strlen(LCZ_COAP_CBOR_KEY_TUNNEL_ID) ||
-	    strncmp(key.value, LCZ_COAP_CBOR_KEY_TUNNEL_ID, strlen(LCZ_COAP_CBOR_KEY_TUNNEL_ID)) !=
-		    0 ||
-	    zcbor_uint32_decode(zsd, &tunnel_id) == false || zcbor_map_end_decode(zsd) == false) {
-		LOG_ERR("handle_open_tunnel_resp: decode failed");
-		rc = -EINVAL;
+	struct zcbor_map_decode_key_val open_tunnel_decode[] = {
+		ZCBOR_MAP_DECODE_KEY_VAL(i, zcbor_uint32_decode, &tunnel_id),
+	};
+
+	/* Parse the input */
+	if (rc == 0) {
+		ok = zcbor_map_decode_bulk(zsd, open_tunnel_decode, ARRAY_SIZE(open_tunnel_decode),
+					   &decoded) == 0;
+		if (ok == false) {
+			LOG_ERR("handle_open_tunnel_resp: Invalid input");
+			rc = -EINVAL;
+		}
 	}
 
 	/* Get the device-specific data */
@@ -624,19 +932,21 @@ static int handle_open_tunnel_resp(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx, zcbor_st
 	/* Validate the message */
 	if (rc == 0) {
 		if (pdev == NULL || tunnel_id != pdev->tunnel_id) {
-			/* Block this device for a period of time */
-			lcz_lwm2m_gw_obj_add_blocklist(
-				pctx->dev_idx,
-				CONFIG_LCZ_LWM2M_GATEWAY_PROXY_BLOCKLIST_TIME_SECONDS);
+			/* Record the error for this device */
+			dev_error(pctx, true);
 
 			/*
 			 * Wrong tunnel ID. Returning an error here will
 			 * cause the connection to be closed.
 			 */
-			LOG_WRN("handle_open_tunnel_resp: peripheral returned tunnel id %d",
+			LOG_WRN("handle_open_tunnel_resp: peripheral replied with tunnel id %d",
 				tunnel_id);
 			rc = -EINVAL;
 		}
+	}
+
+	if (rc == 0) {
+		pctx->flags |= CTX_FLAG_CLIENT_TUNNEL_OPEN;
 	}
 
 	return rc;
@@ -653,22 +963,31 @@ static int handle_tunnel_data(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx, zcbor_state_t
 {
 	LCZ_LWM2M_GATEWAY_PROXY_DEV_T *pdev;
 	uint32_t tunnel_id;
-	struct zcbor_string key;
-	struct zcbor_string value;
+	struct zcbor_string data;
 	eventfd_t event_val;
+	bool ok;
+	size_t decoded;
 	int rc = 0;
 
-	if (zcbor_map_start_decode(zsd) == false || zcbor_tstr_decode(zsd, &key) == false ||
-	    key.len != strlen(LCZ_COAP_CBOR_KEY_TUNNEL_ID) ||
-	    strncmp(key.value, LCZ_COAP_CBOR_KEY_TUNNEL_ID, strlen(LCZ_COAP_CBOR_KEY_TUNNEL_ID)) !=
-		    0 ||
-	    zcbor_uint32_decode(zsd, &tunnel_id) == false ||
-	    zcbor_tstr_decode(zsd, &key) == false || key.len != strlen(LCZ_COAP_CBOR_KEY_DATA) ||
-	    strncmp(key.value, LCZ_COAP_CBOR_KEY_DATA, strlen(LCZ_COAP_CBOR_KEY_DATA)) != 0 ||
-	    zcbor_bstr_decode(zsd, &value) == false || value.len == 0 ||
-	    zcbor_map_end_decode(zsd) == false) {
-		LOG_ERR("handle_tunnel_data: decode failed");
-		rc = -EINVAL;
+	struct zcbor_map_decode_key_val tunnel_data_decode[] = {
+		ZCBOR_MAP_DECODE_KEY_VAL(i, zcbor_uint32_decode, &tunnel_id),
+		ZCBOR_MAP_DECODE_KEY_VAL(d, zcbor_bstr_decode, &data)
+	};
+
+	/* If we are authorized, we shouldn't be getting the unencrypted message */
+	if ((pctx->flags & CTX_FLAG_CLIENT_AUTHORIZED) != 0) {
+		LOG_ERR("handle_tunnel_data: Connection is authorized, expected encrypted tunnel data");
+		rc = -EPERM;
+	}
+
+	/* Parse the input */
+	if (rc == 0) {
+		ok = zcbor_map_decode_bulk(zsd, tunnel_data_decode, ARRAY_SIZE(tunnel_data_decode),
+					   &decoded) == 0;
+		if (!ok || data.len == 0) {
+			LOG_ERR("handle_tunnel_data: Invalid input");
+			rc = -EINVAL;
+		}
 	}
 
 	/* Get the device-specific data */
@@ -677,18 +996,125 @@ static int handle_tunnel_data(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx, zcbor_state_t
 	/* If message is valid, handle it */
 	if (rc == 0 && pdev != NULL && tunnel_id == pdev->tunnel_id) {
 		/* Add it to our RX queue */
-		if (add_to_queue(&(pctx->rx_queue), (uint8_t *)value.value, value.len) == 0) {
+		if (add_to_queue(&(pctx->rx_queue), (uint8_t *)data.value, data.len) == 0) {
 			/* Signal the event FD that data is ready to be read */
 			event_val = EVENTFD_DATA_READY;
 			(void)eventfd_write(pctx->ctx.sock_fd, event_val);
 		}
 	} else if (rc == 0) {
-		LOG_ERR("handle_tunnel_data: peripheral returned tunnel id %d", tunnel_id);
+		LOG_ERR("handle_tunnel_data: peripheral used incorrect tunnel id %d", tunnel_id);
 		rc = -EINVAL;
 	}
 
 	return rc;
 }
+
+#if defined(CONFIG_LCZ_PKI_AUTH_SMP_CENTRAL)
+/** @brief Handler for the Tunnel Encrypted Data message from the peripheral
+ *
+ * @param[in] pctx Proxy context pointer for the transport connection
+ * @param[in] zsd ZCBOR state for decoding the Tunnel Data message
+ *
+ * @returns 0 on success, <0 on error.
+ */
+static int handle_tunnel_enc_data(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx, zcbor_state_t *zsd)
+{
+	LCZ_LWM2M_GATEWAY_PROXY_DEV_T *pdev;
+	uint32_t tunnel_id;
+	struct zcbor_string data;
+	eventfd_t event_val;
+	bool ok;
+	size_t decoded;
+	int rc = 0;
+	psa_key_id_t enc_key = PSA_KEY_HANDLE_INIT;
+	size_t nonce_len;
+	size_t plaintext_size;
+	size_t plaintext_out;
+	uint8_t *plaintext = NULL;
+
+	struct zcbor_map_decode_key_val tunnel_data_decode[] = {
+		ZCBOR_MAP_DECODE_KEY_VAL(i, zcbor_uint32_decode, &tunnel_id),
+		ZCBOR_MAP_DECODE_KEY_VAL(d, zcbor_bstr_decode, &data)
+	};
+
+	/* If we are not authorized, we shouldn't be getting the encrypted message */
+	if ((pctx->flags & CTX_FLAG_CLIENT_AUTHORIZED) == 0) {
+		LOG_ERR("handle_tunnel_enc_data: Connection is not authorized, expected unencrypted tunnel data");
+		rc = -EPERM;
+	}
+
+	/* Parse the input */
+	if (rc == 0) {
+		ok = zcbor_map_decode_bulk(zsd, tunnel_data_decode, ARRAY_SIZE(tunnel_data_decode),
+					   &decoded) == 0;
+		if (!ok || data.len == 0) {
+			LOG_ERR("handle_tunnel_enc_data: Invalid input");
+			rc = -EINVAL;
+		}
+	}
+
+	/* Get the device-specific data */
+	pdev = lcz_lwm2m_gw_obj_get_dm_data(pctx->dev_idx);
+
+	/* If message is valid, handle it */
+	if (rc == 0 && pdev != NULL && tunnel_id == pdev->tunnel_id) {
+		/* Calculate sizes */
+		nonce_len = PSA_AEAD_NONCE_LENGTH(LCZ_PKI_AUTH_SMP_SESSION_KEY_TYPE,
+						  LCZ_PKI_AUTH_SMP_SESSION_ENC_KEY_ALG);
+		plaintext_size = PSA_AEAD_DECRYPT_OUTPUT_SIZE(LCZ_PKI_AUTH_SMP_SESSION_KEY_TYPE,
+							      LCZ_PKI_AUTH_SMP_SESSION_ENC_KEY_ALG,
+							      data.len - nonce_len);
+
+		/* Allocate memory to hold the plaintext */
+		plaintext = (uint8_t *)k_malloc(plaintext_size);
+		if (plaintext == NULL) {
+			LOG_ERR("handle_tunnel_enc_data: Cannot allocate plaintext buffer");
+			rc = -ENOMEM;
+		}
+
+		/* Retrieve the key for this connection */
+		if (rc == 0) {
+			rc = lcz_pki_auth_smp_central_get_keys(bt_conn_get_dst(pctx->active_conn),
+							       &enc_key, NULL);
+			if (rc != 0) {
+				LOG_ERR("handle_tunnel_enc_data: Could not retrieve keys: %d", rc);
+			}
+		}
+
+		/* Decrypt the data */
+		if (rc == 0) {
+			rc = psa_aead_decrypt(enc_key, LCZ_PKI_AUTH_SMP_SESSION_ENC_KEY_ALG,
+					      data.value, nonce_len, (uint8_t *)&(pdev->tunnel_id),
+					      sizeof(pdev->tunnel_id), data.value + nonce_len,
+					      data.len - nonce_len, plaintext, plaintext_size,
+					      &plaintext_out);
+			if (rc != PSA_SUCCESS) {
+				LOG_ERR("handle_tunnel_enc_data: failed to decrypt: %d", rc);
+			}
+		}
+
+		/* Add it to our RX queue */
+		if (rc == 0) {
+			if (add_to_queue(&(pctx->rx_queue), plaintext, plaintext_out) == 0) {
+				/* Signal the event FD that data is ready to be read */
+				event_val = EVENTFD_DATA_READY;
+				(void)eventfd_write(pctx->ctx.sock_fd, event_val);
+			}
+		}
+
+		/* Free the memory that we allocated */
+		if (plaintext != NULL) {
+			k_free(plaintext);
+		}
+	} else if (rc == 0) {
+		LOG_ERR("handle_tunnel_enc_data: peripheral used incorrect tunnel id %d",
+			tunnel_id);
+		rc = -EINVAL;
+	}
+
+	return rc;
+}
+#endif
 
 /** @brief Handler for the Tunnel Data response message from the peripheral
  *
@@ -701,17 +1127,22 @@ static int handle_tunnel_data_resp(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx, zcbor_st
 {
 	LCZ_LWM2M_GATEWAY_PROXY_DEV_T *pdev;
 	uint32_t tunnel_id = 0;
-	struct zcbor_string key;
 	int rc = 0;
+	bool ok;
+	size_t decoded;
 
-	/* Decode the CBOR payload */
-	if (zcbor_map_start_decode(zsd) == false || zcbor_tstr_decode(zsd, &key) == false ||
-	    key.len != strlen(LCZ_COAP_CBOR_KEY_TUNNEL_ID) ||
-	    strncmp(key.value, LCZ_COAP_CBOR_KEY_TUNNEL_ID, strlen(LCZ_COAP_CBOR_KEY_TUNNEL_ID)) !=
-		    0 ||
-	    zcbor_uint32_decode(zsd, &tunnel_id) == false || zcbor_map_end_decode(zsd) == false) {
-		LOG_ERR("handle_tunnel_data_resp: decode failed");
-		rc = -EINVAL;
+	struct zcbor_map_decode_key_val tunnel_data_decode[] = {
+		ZCBOR_MAP_DECODE_KEY_VAL(i, zcbor_uint32_decode, &tunnel_id),
+	};
+
+	/* Parse the input */
+	if (rc == 0) {
+		ok = zcbor_map_decode_bulk(zsd, tunnel_data_decode, ARRAY_SIZE(tunnel_data_decode),
+					   &decoded) == 0;
+		if (ok == false) {
+			LOG_ERR("handle_tunnel_data_resp: decode failed");
+			rc = -EINVAL;
+		}
 	}
 
 	/* Get the device-specific data */
@@ -728,6 +1159,11 @@ static int handle_tunnel_data_resp(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx, zcbor_st
 				tunnel_id);
 			rc = -EINVAL;
 		}
+	}
+
+	/* If we were successful, clear any fault counts */
+	if (rc == 0) {
+		dev_success(pctx);
 	}
 
 	return rc;
@@ -744,17 +1180,22 @@ static int handle_close_tunnel_resp(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx, zcbor_s
 {
 	LCZ_LWM2M_GATEWAY_PROXY_DEV_T *pdev;
 	uint32_t tunnel_id = 0;
-	struct zcbor_string key;
 	int rc = 0;
+	bool ok;
+	size_t decoded;
 
-	/* Decode the CBOR payload */
-	if (zcbor_map_start_decode(zsd) == false || zcbor_tstr_decode(zsd, &key) == false ||
-	    key.len != strlen(LCZ_COAP_CBOR_KEY_TUNNEL_ID) ||
-	    strncmp(key.value, LCZ_COAP_CBOR_KEY_TUNNEL_ID, strlen(LCZ_COAP_CBOR_KEY_TUNNEL_ID)) !=
-		    0 ||
-	    zcbor_uint32_decode(zsd, &tunnel_id) == false || zcbor_map_end_decode(zsd) == false) {
-		LOG_ERR("handle_close_tunnel_resp: decode failed");
-		rc = -EINVAL;
+	struct zcbor_map_decode_key_val close_tunnel_decode[] = {
+		ZCBOR_MAP_DECODE_KEY_VAL(i, zcbor_uint32_decode, &tunnel_id),
+	};
+
+	/* Parse the input */
+	if (rc == 0) {
+		ok = zcbor_map_decode_bulk(zsd, close_tunnel_decode,
+					   ARRAY_SIZE(close_tunnel_decode), &decoded) == 0;
+		if (ok == false) {
+			LOG_ERR("handle_close_tunnel_resp: decode failed");
+			rc = -EINVAL;
+		}
 	}
 
 	/* Get the device-specific data */
@@ -776,6 +1217,61 @@ static int handle_close_tunnel_resp(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx, zcbor_s
 	return rc;
 }
 
+#if defined(CONFIG_LCZ_PKI_AUTH_SMP_CENTRAL)
+/** @brief Handler for the Tunnel Encrypted Data response message from the peripheral
+ *
+ * @param[in] pctx Proxy context pointer for the transport connection
+ * @param[in] zsd ZCBOR state for decoding the Tunnel Data response message
+ *
+ * @returns 0 on success, <0 on error.
+ */
+static int handle_tunnel_enc_data_resp(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx, zcbor_state_t *zsd)
+{
+	LCZ_LWM2M_GATEWAY_PROXY_DEV_T *pdev;
+	uint32_t tunnel_id = 0;
+	int rc = 0;
+	bool ok;
+	size_t decoded;
+
+	struct zcbor_map_decode_key_val tunnel_data_decode[] = {
+		ZCBOR_MAP_DECODE_KEY_VAL(i, zcbor_uint32_decode, &tunnel_id),
+	};
+
+	/* Parse the input */
+	if (rc == 0) {
+		ok = zcbor_map_decode_bulk(zsd, tunnel_data_decode, ARRAY_SIZE(tunnel_data_decode),
+					   &decoded) == 0;
+		if (ok == false) {
+			LOG_ERR("handle_tunnel_enc_data_resp: decode failed");
+			rc = -EINVAL;
+		}
+	}
+
+	/* Get the device-specific data */
+	pdev = lcz_lwm2m_gw_obj_get_dm_data(pctx->dev_idx);
+
+	/* Validate the message */
+	if (rc == 0) {
+		if (pdev == NULL || tunnel_id != pdev->tunnel_id) {
+			/*
+			 * Wrong tunnel ID. Returning an error here will
+			 * cause the connection to be closed.
+			 */
+			LOG_ERR("handle_tunnel_enc_data_resp: peripheral returned tunnel id %d",
+				tunnel_id);
+			rc = -EINVAL;
+		}
+	}
+
+	/* If we were successful, clear any fault counts */
+	if (rc == 0) {
+		dev_success(pctx);
+	}
+
+	return rc;
+}
+#endif
+
 /** @brief Handler for a received CoAP tunnel SMP message from the peripheral
  *
  * @param[in] pctx Proxy context pointer for the transport connection
@@ -784,17 +1280,17 @@ static int handle_close_tunnel_resp(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx, zcbor_s
  */
 static int handle_smp_message(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx)
 {
-	uint16_t payload_len = ((uint16_t)pctx->smp_rsp_buff.header.len_h8) << 8 |
-			       pctx->smp_rsp_buff.header.len_l8;
+	uint16_t payload_len = ((uint16_t)pctx->smp_rsp_buff->header.len_h8) << 8 |
+			       pctx->smp_rsp_buff->header.len_l8;
 	int err = -EINVAL;
 	zcbor_state_t states[CONFIG_MGMT_MAX_DECODING_LEVELS + 2];
 
 	/* Initialize the CBOR reader */
-	zcbor_new_state(states, sizeof(states) / sizeof(zcbor_state_t), pctx->smp_rsp_buff.payload,
+	zcbor_new_state(states, sizeof(states) / sizeof(zcbor_state_t), pctx->smp_rsp_buff->payload,
 			payload_len, 1);
 
-	if (pctx->smp_rsp_buff.header.op == MGMT_OP_WRITE_RSP) {
-		switch (pctx->smp_rsp_buff.header.id) {
+	if (pctx->smp_rsp_buff->header.op == MGMT_OP_WRITE_RSP) {
+		switch (pctx->smp_rsp_buff->header.id) {
 		case LCZ_COAP_MGMT_ID_OPEN_TUNNEL:
 			err = handle_open_tunnel_resp(pctx, states);
 			break;
@@ -804,17 +1300,27 @@ static int handle_smp_message(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx)
 		case LCZ_COAP_MGMT_ID_CLOSE_TUNNEL:
 			err = handle_close_tunnel_resp(pctx, states);
 			break;
+#if defined(CONFIG_LCZ_PKI_AUTH_SMP_CENTRAL)
+		case LCZ_COAP_MGMT_ID_TUNNEL_ENC_DATA:
+			err = handle_tunnel_enc_data_resp(pctx, states);
+			break;
+#endif
 		default:
-			LOG_ERR("Unknown SMP write response ID %d", pctx->smp_rsp_buff.header.id);
+			LOG_ERR("Unknown SMP write response ID %d", pctx->smp_rsp_buff->header.id);
 			break;
 		}
-	} else if (pctx->smp_rsp_buff.header.op == LCZ_COAP_MGMT_OP_NOTIFY) {
-		switch (pctx->smp_rsp_buff.header.id) {
+	} else if (pctx->smp_rsp_buff->header.op == LCZ_COAP_MGMT_OP_NOTIFY) {
+		switch (pctx->smp_rsp_buff->header.id) {
 		case LCZ_COAP_MGMT_ID_TUNNEL_DATA:
 			err = handle_tunnel_data(pctx, states);
 			break;
+#if defined(CONFIG_LCZ_PKI_AUTH_SMP_CENTRAL)
+		case LCZ_COAP_MGMT_ID_TUNNEL_ENC_DATA:
+			err = handle_tunnel_enc_data(pctx, states);
+			break;
+#endif
 		default:
-			LOG_ERR("Unknown SMP notify ID %d", pctx->smp_rsp_buff.header.id);
+			LOG_ERR("Unknown SMP notify ID %d", pctx->smp_rsp_buff->header.id);
 			break;
 		}
 	}
@@ -830,7 +1336,7 @@ static void smp_client_resp_handler(struct bt_dfu_smp *dfu_smp)
 {
 	LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx =
 		CONTAINER_OF(dfu_smp, LCZ_LWM2M_GATEWAY_PROXY_CTX_T, smp_client);
-	uint8_t *p_outdata = (uint8_t *)(&(pctx->smp_rsp_buff));
+	uint8_t *p_outdata;
 	const struct bt_dfu_smp_rsp_state *rsp_state;
 	int err = 0;
 
@@ -840,13 +1346,37 @@ static void smp_client_resp_handler(struct bt_dfu_smp *dfu_smp)
 	/* Get the current response state */
 	rsp_state = bt_dfu_smp_rsp_state(dfu_smp);
 
-	/* Copy the new data in our response buffer */
-	if (rsp_state->offset + rsp_state->chunk_size > sizeof(pctx->smp_rsp_buff)) {
-		LOG_ERR("Response size buffer overflow");
-		err = -ENOMEM;
+	/* Make sure a reassembly buffer is available */
+	if (pctx->smp_rsp_buff != NULL) {
+		if (rsp_state->offset == 0) {
+			LOG_ERR("smp_client_resp_handler: New SMP request, but unfinished reassembly exists.");
+		}
 	} else {
-		p_outdata += rsp_state->offset;
-		memcpy(p_outdata, rsp_state->data, rsp_state->chunk_size);
+		if (rsp_state->offset != 0) {
+			LOG_ERR("smp_client_resp_handler: Continued SMP request, but no reassembly buffer exists.");
+			err = -EINVAL;
+		}
+		if (err == 0) {
+			pctx->smp_rsp_buff = (struct lwm2m_gw_smp_buffer *)k_malloc(
+				CONFIG_LCZ_LWM2M_TRANSPORT_BLE_MAX_PACKET);
+			if (pctx->smp_rsp_buff == NULL) {
+				LOG_ERR("smp_client_resp_handler: Could not allocate reassembly buffer");
+				err = -ENOMEM;
+			}
+		}
+	}
+
+	/* Copy the new data in our response buffer */
+	if (err == 0) {
+		p_outdata = (uint8_t *)pctx->smp_rsp_buff;
+		if (rsp_state->offset + rsp_state->chunk_size >
+		    CONFIG_LCZ_LWM2M_TRANSPORT_BLE_MAX_PACKET) {
+			LOG_ERR("smp_client_resp_handler: Reassembly buffer overflow");
+			err = -ENOMEM;
+		} else {
+			p_outdata += rsp_state->offset;
+			memcpy(p_outdata, rsp_state->data, rsp_state->chunk_size);
+		}
 	}
 
 	/* Check to see if that was the end of the message */
@@ -859,8 +1389,8 @@ static void smp_client_resp_handler(struct bt_dfu_smp *dfu_smp)
 
 	/* Verify the group ID in the message */
 	if (err == 0) {
-		uint16_t group = ((uint16_t)pctx->smp_rsp_buff.header.group_h8) << 8 |
-				 pctx->smp_rsp_buff.header.group_l8;
+		uint16_t group = ((uint16_t)pctx->smp_rsp_buff->header.group_h8) << 8 |
+				 pctx->smp_rsp_buff->header.group_l8;
 		if (group != CONFIG_LCZ_LWM2M_TRANSPORT_BLE_SMP_GROUP) {
 			LOG_ERR("SMP response has wrong group");
 			err = -EINVAL;
@@ -868,7 +1398,7 @@ static void smp_client_resp_handler(struct bt_dfu_smp *dfu_smp)
 	}
 
 	/* Handle the write response */
-	if (err == 0 && pctx->smp_rsp_buff.header.op == MGMT_OP_WRITE_RSP) {
+	if (err == 0 && pctx->smp_rsp_buff->header.op == MGMT_OP_WRITE_RSP) {
 		/* Process the recevied message */
 		err = handle_smp_message(pctx);
 
@@ -882,15 +1412,21 @@ static void smp_client_resp_handler(struct bt_dfu_smp *dfu_smp)
 	}
 
 	/* Handle the notification */
-	else if (err == 0 && pctx->smp_rsp_buff.header.op == LCZ_COAP_MGMT_OP_NOTIFY) {
+	else if (err == 0 && pctx->smp_rsp_buff->header.op == LCZ_COAP_MGMT_OP_NOTIFY) {
 		/* Process the recevied message */
 		err = handle_smp_message(pctx);
 	}
 
 	/* Any other operations are errors */
 	else if (err == 0) {
-		LOG_ERR("Invalid SMP operation %d", pctx->smp_rsp_buff.header.op);
+		LOG_ERR("Invalid SMP operation %d", pctx->smp_rsp_buff->header.op);
 		err = -EINVAL;
+	}
+
+	/* Free the reassembly buffer */
+	if ((err != -EAGAIN) && (pctx->smp_rsp_buff != NULL)) {
+		k_free(pctx->smp_rsp_buff);
+		pctx->smp_rsp_buff = NULL;
 	}
 
 	/* Release the mutex lock for our data */
@@ -898,6 +1434,9 @@ static void smp_client_resp_handler(struct bt_dfu_smp *dfu_smp)
 
 	/* Handle any errors from above */
 	if (err != 0 && err != -EAGAIN) {
+		/* Report the error */
+		dev_error(pctx, false);
+
 		if (pctx->ctx.fault_cb != NULL) {
 			pctx->ctx.fault_cb(&(pctx->ctx), err);
 		}
@@ -917,7 +1456,12 @@ static void dfu_smp_on_error(struct bt_dfu_smp *dfu_smp, int err)
 {
 	LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx =
 		CONTAINER_OF(dfu_smp, LCZ_LWM2M_GATEWAY_PROXY_CTX_T, smp_client);
+
 	LOG_ERR("DFU SMP generic error: %d", err);
+
+	/* Report the error */
+	dev_error(pctx, false);
+
 	if (pctx->ctx.fault_cb != NULL) {
 		pctx->ctx.fault_cb(&(pctx->ctx), err);
 	}
@@ -986,6 +1530,9 @@ static void bt_connected(struct bt_conn *conn, uint8_t conn_err)
 		bt_conn_unref(conn);
 		pctx->active_conn = NULL;
 
+		/* Report the error */
+		dev_error(pctx, false);
+
 		if (pctx->ctx.fault_cb != NULL) {
 			pctx->ctx.fault_cb(&(pctx->ctx), conn_err);
 		}
@@ -998,21 +1545,15 @@ static void bt_connected(struct bt_conn *conn, uint8_t conn_err)
 
 		/* Enable security on the connection */
 		err = bt_conn_set_security(conn, BT_SECURITY_L2);
-		if (err) {
+		if (err != 0) {
 			LOG_ERR("Failed to set security: %d", err);
-			if (pctx->ctx.fault_cb != NULL) {
-				pctx->ctx.fault_cb(&(pctx->ctx), err);
-			}
 		}
 
 		/* Request the data length update */
 		if (err == 0) {
 			err = bt_conn_le_data_len_update(conn, BT_LE_DATA_LEN_PARAM_MAX);
-			if (err) {
+			if (err != 0) {
 				LOG_ERR("Data length update failed: %d", err);
-				if (pctx->ctx.fault_cb != NULL) {
-					pctx->ctx.fault_cb(&(pctx->ctx), err);
-				}
 			}
 		}
 
@@ -1020,22 +1561,25 @@ static void bt_connected(struct bt_conn *conn, uint8_t conn_err)
 		if (err == 0) {
 			err = bt_gatt_exchange_mtu(
 				conn, (struct bt_gatt_exchange_params *)&exchange_params);
-			if (err) {
+			if (err != 0) {
 				LOG_ERR("MTU exchange failed: %d", err);
-				if (pctx->ctx.fault_cb != NULL) {
-					pctx->ctx.fault_cb(&(pctx->ctx), err);
-				}
 			}
 		}
 
 		/* Start discovery of the SMP service */
 		if (err == 0) {
 			err = bt_gatt_dm_start(conn, BT_UUID_DFU_SMP_SERVICE, &discovery_cb, pctx);
-			if (err) {
+			if (err != 0) {
 				LOG_ERR("Could not start discovery: %d", err);
-				if (pctx->ctx.fault_cb != NULL) {
-					pctx->ctx.fault_cb(&(pctx->ctx), err);
-				}
+			}
+		}
+
+		if (err != 0) {
+			/* Report the error */
+			dev_error(pctx, false);
+
+			if (pctx->ctx.fault_cb != NULL) {
+				pctx->ctx.fault_cb(&(pctx->ctx), err);
 			}
 		}
 	}
@@ -1102,21 +1646,34 @@ static void bt_security_changed(struct bt_conn *conn, bt_security_t level, enum 
 	/* Look up our context based on the connection */
 	pctx = lcz_lwm2m_gateway_proxy_conn_to_context(conn);
 	if (pctx != NULL) {
-		/* If the security change was successful, start the tunnel */
+		/* If the security change was successful, start the authorization process */
 		if (level == BT_SECURITY_L2 && err == BT_SECURITY_ERR_SUCCESS) {
 			/* Client tunnel is now secure */
 			pctx->flags |= CTX_FLAG_CLIENT_SECURE;
 			pctx->flags &= ~CTX_FLAG_CLIENT_TUNNEL_BUSY;
 
-			/* If client tunnel is open, send the Open Tunnel command */
-			if ((pctx->flags & CTX_FLAG_CLIENT_TUNNEL_OPEN) == CTX_FLAG_CLIENT_TUNNEL_OPEN) {
-				smp_client_send_open_tunnel(pctx);
+			/* If connection is open, start the authorization process */
+			if ((pctx->flags & (CTX_FLAG_CLIENT_SECURE | CTX_FLAG_CLIENT_DISCOVER)) ==
+			    (CTX_FLAG_CLIENT_SECURE | CTX_FLAG_CLIENT_DISCOVER)) {
+#if defined(CONFIG_LCZ_PKI_AUTH_SMP_CENTRAL)
+				err = lcz_pki_auth_smp_central_start_auth(&(pctx->smp_client));
+				if (err != 0) {
+					LOG_ERR("Could not start SMP authorization: %d", err);
+					auth_complete_cb(bt_conn_get_dst(conn), false);
+				}
+#else
+				/* Assume authentication failed */
+				auth_complete_cb(bt_conn_get_dst(conn), false);
+#endif
 			}
 		} else {
 			LOG_ERR("bt_security_changed: fail with level %d err %d", level, err);
 
 			/* Try unpairing this device if this happens */
 			(void)bt_unpair(BT_ID_DEFAULT, bt_conn_get_dst(conn));
+
+			/* Report the error */
+			dev_error(pctx, false);
 
 			if (pctx->ctx.fault_cb != NULL) {
 				pctx->ctx.fault_cb(&(pctx->ctx), err);
@@ -1138,6 +1695,10 @@ static void discovery_completed_cb(struct bt_gatt_dm *dm, void *context)
 	err = bt_dfu_smp_handles_assign(dm, &(pctx->smp_client));
 	if (err) {
 		LOG_ERR("Could not init DFU SMP client object, error: %d", err);
+
+		/* Report the error */
+		dev_error(pctx, false);
+
 		if (pctx->ctx.fault_cb != NULL) {
 			pctx->ctx.fault_cb(&(pctx->ctx), err);
 		}
@@ -1145,6 +1706,10 @@ static void discovery_completed_cb(struct bt_gatt_dm *dm, void *context)
 		err = bt_gatt_dm_data_release(dm);
 		if (err) {
 			LOG_ERR("Could not release the discovery data, error: %d", err);
+
+			/* Report the error */
+			dev_error(pctx, false);
+
 			if (pctx->ctx.fault_cb != NULL) {
 				pctx->ctx.fault_cb(&(pctx->ctx), err);
 			}
@@ -1154,9 +1719,19 @@ static void discovery_completed_cb(struct bt_gatt_dm *dm, void *context)
 		pctx->flags |= CTX_FLAG_CLIENT_DISCOVER;
 		pctx->flags &= ~CTX_FLAG_CLIENT_TUNNEL_BUSY;
 
-		/* If client tunnel is open, send the Open Tunnel command */
-		if ((pctx->flags & CTX_FLAG_CLIENT_TUNNEL_OPEN) == CTX_FLAG_CLIENT_TUNNEL_OPEN) {
-			smp_client_send_open_tunnel(pctx);
+		/* If connection is open, start the authorization process */
+		if ((pctx->flags & (CTX_FLAG_CLIENT_SECURE | CTX_FLAG_CLIENT_DISCOVER)) ==
+		    (CTX_FLAG_CLIENT_SECURE | CTX_FLAG_CLIENT_DISCOVER)) {
+#if defined(CONFIG_LCZ_PKI_AUTH_SMP_CENTRAL)
+			err = lcz_pki_auth_smp_central_start_auth(&(pctx->smp_client));
+			if (err != 0) {
+				LOG_ERR("Could not start SMP authorization: %d", err);
+				auth_complete_cb(bt_conn_get_dst(pctx->active_conn), false);
+			}
+#else
+			/* Assume authentication failed */
+			auth_complete_cb(bt_conn_get_dst(pctx->active_conn), false);
+#endif
 		}
 	}
 }
@@ -1171,6 +1746,10 @@ static void discovery_service_not_found_cb(struct bt_conn *conn, void *context)
 	LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx = (LCZ_LWM2M_GATEWAY_PROXY_CTX_T *)context;
 
 	LOG_ERR("The SMP service could not be found during the discovery");
+
+	/* Report the error */
+	dev_error(pctx, false);
+
 	if (pctx->ctx.fault_cb != NULL) {
 		pctx->ctx.fault_cb(&(pctx->ctx), -ENOENT);
 	}
@@ -1187,8 +1766,50 @@ static void discovery_error_found_cb(struct bt_conn *conn, int err, void *contex
 	LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx = (LCZ_LWM2M_GATEWAY_PROXY_CTX_T *)context;
 
 	LOG_ERR("The SMP discovery procedure failed with %d", err);
+
+	/* Report the error */
+	dev_error(pctx, false);
+
 	if (pctx->ctx.fault_cb != NULL) {
 		pctx->ctx.fault_cb(&(pctx->ctx), -ENOENT);
+	}
+}
+
+static void auth_complete_cb(const bt_addr_le_t *addr, bool status)
+{
+	LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx;
+	bool auth_required = false;
+
+	/* Read the attribute if it exists */
+#if defined(ATTR_ID_gw_smp_auth_req)
+	auth_required = *(bool *)attr_get_quasi_static(ATTR_ID_gw_smp_auth_req);
+#endif
+
+	/* Look up our context based on the connection */
+	pctx = lcz_lwm2m_gateway_proxy_addr_to_context(addr);
+	if (pctx != NULL) {
+		if (status) {
+			pctx->flags |= CTX_FLAG_CLIENT_AUTHORIZED;
+			k_work_submit(&(pctx->tunnel_tx_work));
+		} else if (auth_required == true) {
+#if defined(CONFIG_LCZ_PKI_AUTH_SMP_CENTRAL)
+			LOG_ERR("The SMP authentication procedure failed");
+#else
+			LOG_ERR("SMP authentication was required, but not compiled in");
+#endif
+
+			/* Report the error */
+			dev_error(pctx, false);
+
+			if (pctx->ctx.fault_cb != NULL) {
+				pctx->ctx.fault_cb(&(pctx->ctx), -ENOENT);
+			}
+		} else {
+#if defined(CONFIG_LCZ_PKI_AUTH_SMP_CENTRAL)
+			LOG_WRN("SMP authentication failed, but was not required");
+#endif
+			k_work_submit(&(pctx->tunnel_tx_work));
+		}
 	}
 }
 
@@ -1203,6 +1824,11 @@ static int lcz_lwm2m_transport_ble_central_init(const struct device *dev)
 
 	/* Register for BT callbacks */
 	bt_conn_cb_register(&conn_callbacks);
+
+#if defined(CONFIG_LCZ_PKI_AUTH_SMP_CENTRAL)
+	/* Register for authorization callbacks */
+	lcz_pki_auth_smp_central_register_handler(&auth_cb_agent);
+#endif
 
 	/* Register our transport with the LwM2M engine */
 	err = lwm2m_transport_register("ble_central",

@@ -123,6 +123,27 @@ LCZ_LWM2M_GATEWAY_PROXY_CTX_T *lcz_lwm2m_gateway_proxy_conn_to_context(struct bt
 	}
 }
 
+LCZ_LWM2M_GATEWAY_PROXY_CTX_T *lcz_lwm2m_gateway_proxy_addr_to_context(const bt_addr_le_t *addr)
+{
+	int i;
+
+	/* Find a matching connection handle */
+	for (i = 0; i < CONFIG_LCZ_LWM2M_GATEWAY_PROXY_NUM_CONTEXTS; i++) {
+		if (((proxy_ctx[i].flags & CTX_FLAG_ACTIVE) != 0) &&
+		    (memcmp(addr, bt_conn_get_dst(proxy_ctx[i].active_conn),
+			    sizeof(bt_addr_le_t)) == 0)) {
+			break;
+		}
+	}
+
+	/* Return what we found */
+	if (i < CONFIG_LCZ_LWM2M_GATEWAY_PROXY_NUM_CONTEXTS) {
+		return &(proxy_ctx[i]);
+	} else {
+		return NULL;
+	}
+}
+
 void lcz_lwm2m_gateway_proxy_device_ready(const bt_addr_le_t *addr)
 {
 	LCZ_LWM2M_GATEWAY_PROXY_DEV_T *pdev;
@@ -151,6 +172,9 @@ void lcz_lwm2m_gateway_proxy_device_ready(const bt_addr_le_t *addr)
 
 				/* Limit tunnel ID to 31 bits */
 				pdev->tunnel_id &= TUNNEL_ID_MASK;
+
+				/* Reset the failure count */
+				pdev->failure_count = 0;
 
 				/* Initialize the TX queue */
 				k_fifo_init(&(pdev->tx_queue));
@@ -272,7 +296,7 @@ static int find_open_context(void)
 
 	/* Search our array for an open context */
 	for (i = 0; i < CONFIG_LCZ_LWM2M_GATEWAY_PROXY_NUM_CONTEXTS; i++) {
-		if ((proxy_ctx[i].flags & CTX_FLAG_ACTIVE) == 0) {
+		if ((proxy_ctx[i].flags & (CTX_FLAG_ACTIVE|CTX_FLAG_STOPPED)) == 0) {
 			break;
 		}
 	}
@@ -823,11 +847,11 @@ static int start_context(int ctx_idx, int dev_idx, uint8_t flags)
 	ret = lwm2m_engine_start(&(proxy_ctx[ctx_idx].ctx));
 	if (ret < 0) {
 		LOG_ERR("Cannot initialize LwM2M proxy context: %d", ret);
-		proxy_ctx[ctx_idx].flags = 0;
+		lwm2m_engine_context_close(&(proxy_ctx[ctx_idx].ctx));
+	} else {
+		/* Start the connection timer */
+		reset_conn_timer(&(proxy_ctx[ctx_idx]));
 	}
-
-	/* Start the connection timer */
-	reset_conn_timer(&(proxy_ctx[ctx_idx]));
 
 	return ret;
 }

@@ -55,6 +55,10 @@ config LCZ_LWM2M_GATEWAY_PROXY_BLOCKLIST_TIME_SECONDS
 	int "Block list time for client claimed by another gateway"
 	default 1800
 
+config LCZ_LWM2M_GATEWAY_PROXY_MAX_FAILURE_COUNT
+	int "Maximum sensor connection failures before blocking"
+	default 3
+
 config LCZ_LWM2M_GATEWAY_PROXY_COAP_FILE
 	bool "LCZ Gateway CoAP File Proxy Support"
 	depends on LCZ_LWM2M_FIRMWARE_UPDATE_PULL_COAP_PROXY_SUPPORT
