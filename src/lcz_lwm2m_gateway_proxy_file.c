@@ -195,7 +195,7 @@ static void coap_file_proxy_start(void)
 		LOG_ERR("Proxy URI is required for CoAP proxy");
 		ret = -EINVAL;
 	} else if (strlen(server_addr) >= CONFIG_LCZ_LWM2M_SWMGMT_PACKAGE_URI_LEN) {
-		LOG_ERR("Proxy URI too long: %s", log_strdup(server_addr));
+		LOG_ERR("Proxy URI too long: %s", server_addr);
 		ret = -EINVAL;
 	}
 

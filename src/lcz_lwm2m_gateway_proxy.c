@@ -842,7 +842,7 @@ static int start_context(int ctx_idx, int dev_idx, uint8_t flags)
 	proxy_ctx[ctx_idx].ctx.observe_cb = NULL;
 
 	LOG_INF("Starting proxy context %d for %s", ctx_idx,
-		log_strdup(lcz_lwm2m_gw_obj_get_addr_string(dev_idx)));
+		lcz_lwm2m_gw_obj_get_addr_string(dev_idx));
 
 	ret = lwm2m_engine_start(&(proxy_ctx[ctx_idx].ctx));
 	if (ret < 0) {
