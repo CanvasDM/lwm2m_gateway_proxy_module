@@ -599,7 +599,7 @@ static int build_tunnel_data(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx,
 #if defined(CONFIG_LCZ_PKI_AUTH_SMP_CENTRAL)
 static int build_tunnel_enc_data(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx,
 				 LCZ_LWM2M_GATEWAY_PROXY_DEV_T *pdev, struct queue_entry_t *item,
-				 psa_key_id_t enc_key, psa_key_id_t sig_key)
+				 psa_key_id_t aead_key)
 {
 	zcbor_state_t zs[CONFIG_MGMT_MAX_DECODING_LEVELS + 2];
 	struct zcbor_string zstr;
@@ -615,10 +615,10 @@ static int build_tunnel_enc_data(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx,
 
 	/* Calculate the size of the encrypted output */
 	nonce_len = PSA_AEAD_NONCE_LENGTH(LCZ_PKI_AUTH_SMP_SESSION_KEY_TYPE,
-					  LCZ_PKI_AUTH_SMP_SESSION_ENC_KEY_ALG);
+					  LCZ_PKI_AUTH_SMP_SESSION_AEAD_KEY_ALG);
 	ciphertext_size =
 		nonce_len + PSA_AEAD_ENCRYPT_OUTPUT_SIZE(LCZ_PKI_AUTH_SMP_SESSION_KEY_TYPE,
-							 LCZ_PKI_AUTH_SMP_SESSION_ENC_KEY_ALG,
+							 LCZ_PKI_AUTH_SMP_SESSION_AEAD_KEY_ALG,
 							 item->length);
 
 	/*
@@ -664,7 +664,7 @@ static int build_tunnel_enc_data(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx,
 
 	/* Encrypt the data */
 	if (err == 0) {
-		err = psa_aead_encrypt(enc_key, LCZ_PKI_AUTH_SMP_SESSION_ENC_KEY_ALG, ciphertext,
+		err = psa_aead_encrypt(aead_key, LCZ_PKI_AUTH_SMP_SESSION_AEAD_KEY_ALG, ciphertext,
 				       nonce_len, (uint8_t *)&(pdev->tunnel_id),
 				       sizeof(pdev->tunnel_id), item->data, item->length,
 				       ciphertext + nonce_len, ciphertext_size - nonce_len,
@@ -758,8 +758,7 @@ static void smp_client_send_work_function(struct k_work *w)
 	int err = 0;
 	struct queue_entry_t *item;
 #if defined(CONFIG_LCZ_PKI_AUTH_SMP_CENTRAL)
-	psa_key_id_t enc_key = PSA_KEY_HANDLE_INIT;
-	psa_key_id_t sig_key = PSA_KEY_HANDLE_INIT;
+	psa_key_id_t aead_key = PSA_KEY_HANDLE_INIT;
 #endif
 
 	/* Acquire a mutex lock for our data */
@@ -777,10 +776,9 @@ static void smp_client_send_work_function(struct k_work *w)
 #if defined(CONFIG_LCZ_PKI_AUTH_SMP_CENTRAL)
 			if ((pctx->flags & CTX_FLAG_CLIENT_AUTHORIZED) != 0) {
 				err = lcz_pki_auth_smp_central_get_keys(
-					bt_conn_get_dst(pctx->active_conn), &enc_key, &sig_key);
+					bt_conn_get_dst(pctx->active_conn), &aead_key, NULL, NULL);
 				if (err == 0) {
-					err = build_tunnel_enc_data(pctx, pdev, item, enc_key,
-								    sig_key);
+					err = build_tunnel_enc_data(pctx, pdev, item, aead_key);
 				} else {
 					LOG_ERR("Could not retrieve session keys: %d", err);
 				}
@@ -932,15 +930,16 @@ static int handle_open_tunnel_resp(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx, zcbor_st
 	/* Validate the message */
 	if (rc == 0) {
 		if (pdev == NULL || tunnel_id != pdev->tunnel_id) {
-			/* Record the error for this device */
-			dev_error(pctx, true);
-
 			/*
 			 * Wrong tunnel ID. Returning an error here will
 			 * cause the connection to be closed.
 			 */
 			LOG_WRN("handle_open_tunnel_resp: peripheral replied with tunnel id %d",
 				tunnel_id);
+
+			/* Record the error for this device */
+			dev_error(pctx, true);
+
 			rc = -EINVAL;
 		}
 	}
@@ -1026,7 +1025,7 @@ static int handle_tunnel_enc_data(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx, zcbor_sta
 	bool ok;
 	size_t decoded;
 	int rc = 0;
-	psa_key_id_t enc_key = PSA_KEY_HANDLE_INIT;
+	psa_key_id_t aead_key = PSA_KEY_HANDLE_INIT;
 	size_t nonce_len;
 	size_t plaintext_size;
 	size_t plaintext_out;
@@ -1060,9 +1059,9 @@ static int handle_tunnel_enc_data(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx, zcbor_sta
 	if (rc == 0 && pdev != NULL && tunnel_id == pdev->tunnel_id) {
 		/* Calculate sizes */
 		nonce_len = PSA_AEAD_NONCE_LENGTH(LCZ_PKI_AUTH_SMP_SESSION_KEY_TYPE,
-						  LCZ_PKI_AUTH_SMP_SESSION_ENC_KEY_ALG);
+						  LCZ_PKI_AUTH_SMP_SESSION_AEAD_KEY_ALG);
 		plaintext_size = PSA_AEAD_DECRYPT_OUTPUT_SIZE(LCZ_PKI_AUTH_SMP_SESSION_KEY_TYPE,
-							      LCZ_PKI_AUTH_SMP_SESSION_ENC_KEY_ALG,
+							      LCZ_PKI_AUTH_SMP_SESSION_AEAD_KEY_ALG,
 							      data.len - nonce_len);
 
 		/* Allocate memory to hold the plaintext */
@@ -1075,7 +1074,7 @@ static int handle_tunnel_enc_data(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx, zcbor_sta
 		/* Retrieve the key for this connection */
 		if (rc == 0) {
 			rc = lcz_pki_auth_smp_central_get_keys(bt_conn_get_dst(pctx->active_conn),
-							       &enc_key, NULL);
+							       &aead_key, NULL, NULL);
 			if (rc != 0) {
 				LOG_ERR("handle_tunnel_enc_data: Could not retrieve keys: %d", rc);
 			}
@@ -1083,7 +1082,7 @@ static int handle_tunnel_enc_data(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx, zcbor_sta
 
 		/* Decrypt the data */
 		if (rc == 0) {
-			rc = psa_aead_decrypt(enc_key, LCZ_PKI_AUTH_SMP_SESSION_ENC_KEY_ALG,
+			rc = psa_aead_decrypt(aead_key, LCZ_PKI_AUTH_SMP_SESSION_AEAD_KEY_ALG,
 					      data.value, nonce_len, (uint8_t *)&(pdev->tunnel_id),
 					      sizeof(pdev->tunnel_id), data.value + nonce_len,
 					      data.len - nonce_len, plaintext, plaintext_size,
