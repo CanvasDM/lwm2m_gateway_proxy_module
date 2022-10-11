@@ -31,6 +31,7 @@ LOG_MODULE_REGISTER(lcz_lwm2m_gateway_proxy_scan, CONFIG_LCZ_LWM2M_GATEWAY_PROXY
 /* Local Constant, Macro and Type Definitions                                                     */
 /**************************************************************************************************/
 #define SCAN_RESTART_DELAY_SECONDS 2
+#define LWM2M_DATA_READY_FLAG BIT(0)
 
 /**************************************************************************************************/
 /* Local Function Prototypes                                                                      */
@@ -86,9 +87,8 @@ void lcz_lwm2m_gateway_proxy_scan_pause(void)
  */
 static void ad_filter(const bt_addr_le_t *addr, LczSensorAdEvent_t *p, int8_t rssi)
 {
-	/* If Alarm 4 flag is set, treat that as pending LwM2M traffic */
-	/* Bug #22088: Update this to use the correct advertising flag */
-	if (p != NULL && (p->flags & (1 << 11)) != 0) {
+	/* If flag bit 0 is set, treat that as pending LwM2M traffic */
+	if (p != NULL && (p->flags & LWM2M_DATA_READY_FLAG) != 0) {
 		lcz_lwm2m_gateway_proxy_device_ready(addr);
 	}
 }
