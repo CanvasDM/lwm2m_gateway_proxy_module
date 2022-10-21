@@ -54,6 +54,9 @@ typedef struct {
 	/* Count of repeated connection failures */
 	uint32_t failure_count;
 
+	/* Current PHY in use by the device */
+	bool coded_phy;
+
 	/* Queue of pending CoAP messages to device */
 	struct k_fifo tx_queue;
 } LCZ_LWM2M_GATEWAY_PROXY_DEV_T;
@@ -65,6 +68,9 @@ typedef struct {
 	uint8_t flags;
 
 	int dev_idx;
+
+	/* Type of advertisement used by the device */
+	bool coded_phy;
 
 	/* Used by the transport layer */
 	struct lwm2m_ctx ctx;
@@ -93,11 +99,24 @@ typedef struct {
 /* Global Function Prototypes                                                                     */
 /**************************************************************************************************/
 /**
+ * @brief Register scan start/stop control functions
+ *
+ * When the CoAP proxy needs to establish a BLE connection with a device, scanning must be stopped
+ * and then restarted when the connection has been established. This function allows the
+ * application to provide the start/stop functions that the CoAP proxy will call.
+ *
+ * @param[in] start_fn Function to call to resume scanning
+ * @param[in] stop_fn Function to call to pause scanning
+ */
+void lcz_lwm2m_gateway_proxy_reg_scan_fns(void (*start_fn)(void), void (*stop_fn)(void));
+
+/**
  * @brief Function to be called when a device has LwM2M traffic ready for the gateway
  *
  * @param[in] addr Bluetooth address of the device with traffic ready
+ * @param[in] coded_phy true if the device is using the coded PHY, false if 1M PHY
  */
-void lcz_lwm2m_gateway_proxy_device_ready(const bt_addr_le_t *addr);
+void lcz_lwm2m_gateway_proxy_device_ready(const bt_addr_le_t *addr, bool coded_phy);
 
 /**
  * @brief Look up a proxy context given a BLE connection handle

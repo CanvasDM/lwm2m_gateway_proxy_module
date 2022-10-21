@@ -28,7 +28,6 @@ LOG_MODULE_REGISTER(lcz_lwm2m_gateway_proxy, CONFIG_LCZ_LWM2M_GATEWAY_PROXY_LOG_
 #include "lcz_lwm2m_client.h"
 #include "lcz_lwm2m_gateway_obj.h"
 #include "lcz_lwm2m_gateway_proxy_file.h"
-#include "lcz_lwm2m_gateway_proxy_scan.h"
 #include "lcz_lwm2m_gateway_proxy.h"
 
 /**************************************************************************************************/
@@ -144,7 +143,7 @@ LCZ_LWM2M_GATEWAY_PROXY_CTX_T *lcz_lwm2m_gateway_proxy_addr_to_context(const bt_
 	}
 }
 
-void lcz_lwm2m_gateway_proxy_device_ready(const bt_addr_le_t *addr)
+void lcz_lwm2m_gateway_proxy_device_ready(const bt_addr_le_t *addr, bool coded_phy)
 {
 	LCZ_LWM2M_GATEWAY_PROXY_DEV_T *pdev;
 	int dev_idx;
@@ -159,7 +158,12 @@ void lcz_lwm2m_gateway_proxy_device_ready(const bt_addr_le_t *addr)
 	/* If we didn't find the device in our database, try to add it */
 	if (dev_idx < 0) {
 		dev_idx = lcz_lwm2m_gw_obj_create(addr);
-		if (dev_idx >= 0) {
+	}
+
+	if (dev_idx != DEV_IDX_INVALID) {
+		/* Allocate our DM-specific data for the device if we haven't yet */
+		pdev = lcz_lwm2m_gw_obj_get_dm_data(dev_idx);
+		if (pdev == NULL) {
 			/* Allocate memory for DM-specific data */
 			pdev = (LCZ_LWM2M_GATEWAY_PROXY_DEV_T *)k_malloc(
 				sizeof(LCZ_LWM2M_GATEWAY_PROXY_DEV_T));
@@ -182,6 +186,11 @@ void lcz_lwm2m_gateway_proxy_device_ready(const bt_addr_le_t *addr)
 				/* Attach the DM-specific data to the gateway object */
 				lcz_lwm2m_gw_obj_set_dm_data(dev_idx, pdev);
 			}
+		}
+
+		/* Store the current device PHY in the device record */
+		if (pdev != NULL) {
+			pdev->coded_phy = coded_phy;
 		}
 	}
 
@@ -296,7 +305,7 @@ static int find_open_context(void)
 
 	/* Search our array for an open context */
 	for (i = 0; i < CONFIG_LCZ_LWM2M_GATEWAY_PROXY_NUM_CONTEXTS; i++) {
-		if ((proxy_ctx[i].flags & (CTX_FLAG_ACTIVE|CTX_FLAG_STOPPED)) == 0) {
+		if ((proxy_ctx[i].flags & (CTX_FLAG_ACTIVE | CTX_FLAG_STOPPED)) == 0) {
 			break;
 		}
 	}
@@ -344,13 +353,7 @@ static void lwm2m_client_connected(struct lwm2m_ctx *client, int lwm2m_client_in
 					proxy_ctx[i].flags = 0;
 				}
 			}
-
-			/* Start scanning */
-			lcz_lwm2m_gateway_proxy_scan_resume();
 		} else {
-			/* Stop scanning */
-			lcz_lwm2m_gateway_proxy_scan_pause();
-
 			/* Block the client contexts */
 			for (i = 0; i < CONFIG_LCZ_LWM2M_GATEWAY_PROXY_NUM_CONTEXTS; i++) {
 				/* If the context is available, block it */
@@ -584,6 +587,11 @@ static void forward_prefixed_message(int dev_idx, struct coap_packet *pkt)
 {
 	LCZ_LWM2M_GATEWAY_PROXY_DEV_T *pdev = lcz_lwm2m_gw_obj_get_dm_data(dev_idx);
 	int ctx_idx;
+
+	/* Unlikely, but if we haven't talked with this device yet, don't forward */
+	if (pdev == NULL) {
+		return;
+	}
 
 	/* Edit the message to remove the prefix */
 	lcz_coap_strip_uri_prefix(pkt);
@@ -822,7 +830,16 @@ static enum lwm2m_coap_resp transport_coap_msg_cb(struct lwm2m_ctx *client_ctx,
  */
 static int start_context(int ctx_idx, int dev_idx, uint8_t flags)
 {
+	LCZ_LWM2M_GATEWAY_PROXY_DEV_T *pdev;
 	int ret;
+
+	/* Get the device data */
+	pdev = lcz_lwm2m_gw_obj_get_dm_data(dev_idx);
+
+	/* Unlikely, but fail if the device data hasn't been created yet */
+	if (pdev == NULL) {
+		return -ENODATA;
+	}
 
 	/* Reset everything in the context structure */
 	memset(&(proxy_ctx[ctx_idx]), 0, sizeof(proxy_ctx[0]));
@@ -840,8 +857,9 @@ static int start_context(int ctx_idx, int dev_idx, uint8_t flags)
 	proxy_ctx[ctx_idx].ctx.fault_cb = transport_fault_cb;
 	proxy_ctx[ctx_idx].ctx.coap_msg_cb = transport_coap_msg_cb;
 	proxy_ctx[ctx_idx].ctx.observe_cb = NULL;
+	proxy_ctx[ctx_idx].coded_phy = pdev->coded_phy;
 
-	LOG_INF("Starting proxy context %d for %s", ctx_idx,
+	LOG_INF("Starting proxy context %d (dev %d) for %s", ctx_idx, dev_idx,
 		lcz_lwm2m_gw_obj_get_addr_string(dev_idx));
 
 	ret = lwm2m_engine_start(&(proxy_ctx[ctx_idx].ctx));

@@ -39,7 +39,6 @@ LOG_MODULE_REGISTER(lcz_lwm2m_ble_central, CONFIG_LCZ_LWM2M_CLIENT_LOG_LEVEL);
 #include "lcz_bluetooth.h"
 #include "lcz_lwm2m_client.h"
 #include "lcz_lwm2m_gateway_obj.h"
-#include "lcz_lwm2m_gateway_proxy_scan.h"
 #include "lcz_lwm2m_gateway_proxy.h"
 
 #if defined(CONFIG_ATTR)
@@ -67,6 +66,10 @@ struct queue_entry_t {
 	size_t length;
 	uint8_t data[1];
 };
+
+#define BT_CONN_CODED_CREATE_CONN                                                                  \
+	BT_CONN_LE_CREATE_PARAM(BT_CONN_LE_OPT_CODED | BT_CONN_LE_OPT_NO_1M,                       \
+				BT_GAP_SCAN_FAST_INTERVAL, BT_GAP_SCAN_FAST_INTERVAL)
 
 /**************************************************************************************************/
 /* Local Function Prototypes                                                                      */
@@ -144,6 +147,10 @@ static struct lcz_pki_auth_smp_central_auth_callback_agent auth_cb_agent = {
 };
 #endif
 
+/* Function pointers for controlling scanning */
+static void (*scan_start_fn)(void) = NULL;
+static void (*scan_stop_fn)(void) = NULL;
+
 /**************************************************************************************************/
 /* Local Function Definitions                                                                     */
 /**************************************************************************************************/
@@ -180,7 +187,6 @@ static void dev_error(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx, bool immed_block)
 
 	/* Get the device-specific data */
 	pdev = lcz_lwm2m_gw_obj_get_dm_data(pctx->dev_idx);
-
 	if (pdev != NULL) {
 		/* Increment the count of failures */
 		if (pdev->failure_count < CONFIG_LCZ_LWM2M_GATEWAY_PROXY_MAX_FAILURE_COUNT) {
@@ -237,7 +243,6 @@ static int lwm2m_transport_ble_central_start(struct lwm2m_ctx *client_ctx)
 {
 	LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx =
 		CONTAINER_OF(client_ctx, LCZ_LWM2M_GATEWAY_PROXY_CTX_T, ctx);
-	struct bt_le_conn_param *param = BT_LE_CONN_PARAM_DEFAULT;
 	int err;
 
 	/* Initialize the work item */
@@ -255,11 +260,15 @@ static int lwm2m_transport_ble_central_start(struct lwm2m_ctx *client_ctx)
 	bt_dfu_smp_init(&(pctx->smp_client), &dfu_init_params);
 
 	/* Stop scanning */
-	lcz_lwm2m_gateway_proxy_scan_pause();
+	if (scan_stop_fn != NULL) {
+		scan_stop_fn();
+	}
 
 	/* Open the BLE connection */
-	err = bt_conn_le_create(lcz_lwm2m_gw_obj_get_address(pctx->dev_idx), BT_CONN_LE_CREATE_CONN,
-				param, &(pctx->active_conn));
+	err = bt_conn_le_create(lcz_lwm2m_gw_obj_get_address(pctx->dev_idx),
+				(pctx->coded_phy) ? BT_CONN_CODED_CREATE_CONN :
+							  BT_CONN_LE_CREATE_CONN,
+				BT_LE_CONN_PARAM_DEFAULT, &(pctx->active_conn));
 	if (err) {
 		LOG_ERR("Create connection failed: %d", err);
 		pctx->active_conn = NULL;
@@ -268,7 +277,9 @@ static int lwm2m_transport_ble_central_start(struct lwm2m_ctx *client_ctx)
 		dev_error(pctx, false);
 
 		/* Resume scanning */
-		lcz_lwm2m_gateway_proxy_scan_resume();
+		if (scan_start_fn != NULL) {
+			scan_start_fn();
+		}
 		return err;
 	} else {
 		/* Create the eventfd file descriptor */
@@ -934,8 +945,8 @@ static int handle_open_tunnel_resp(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx, zcbor_st
 			 * Wrong tunnel ID. Returning an error here will
 			 * cause the connection to be closed.
 			 */
-			LOG_WRN("handle_open_tunnel_resp: peripheral replied with tunnel id %d",
-				tunnel_id);
+			LOG_WRN("handle_open_tunnel_resp: peripheral replied with tunnel id %d, expected %d",
+				tunnel_id, pdev->tunnel_id);
 
 			/* Record the error for this device */
 			dev_error(pctx, true);
@@ -1537,10 +1548,14 @@ static void bt_connected(struct bt_conn *conn, uint8_t conn_err)
 		}
 
 		/* Restart scanning */
-		lcz_lwm2m_gateway_proxy_scan_resume();
+		if (scan_start_fn != NULL) {
+			scan_start_fn();
+		}
 	} else if (pctx != NULL) {
 		/* Restart scanning */
-		lcz_lwm2m_gateway_proxy_scan_resume();
+		if (scan_start_fn != NULL) {
+			scan_start_fn();
+		}
 
 		/* Enable security on the connection */
 		err = bt_conn_set_security(conn, BT_SECURITY_L2);
@@ -1600,7 +1615,9 @@ static void bt_disconnected(struct bt_conn *conn, uint8_t reason)
 
 	if (pctx != NULL) {
 		/* Restart scanning */
-		lcz_lwm2m_gateway_proxy_scan_resume();
+		if (scan_start_fn != NULL) {
+			scan_start_fn();
+		}
 
 		/* Release our reference to the connection */
 		bt_conn_unref(conn);
@@ -1837,4 +1854,13 @@ static int lcz_lwm2m_transport_ble_central_init(const struct device *dev)
 	}
 
 	return err;
+}
+
+/**************************************************************************************************/
+/* Global Function Definitions                                                                    */
+/**************************************************************************************************/
+void lcz_lwm2m_gateway_proxy_reg_scan_fns(void (*start_fn)(void), void (*stop_fn)(void))
+{
+	scan_start_fn = start_fn;
+	scan_stop_fn = stop_fn;
 }

@@ -9,10 +9,6 @@ menuconfig LCZ_LWM2M_GATEWAY_PROXY
 	depends on LCZ_LWM2M_GATEWAY_OBJ
 	depends on LCZ_BLE_GW_DM
 	depends on LCZ_BT
-	depends on LCZ_BT_SCAN
-	depends on LCZ_AD_FIND
-	depends on LCZ_SENSOR_ADV_FORMAT
-	depends on LCZ_SENSOR_ADV_MATCH
 	depends on BT_CENTRAL
 	depends on BT_DFU_SMP
 	depends on BT_GATT_DM
