@@ -62,6 +62,13 @@ config LCZ_LWM2M_GATEWAY_PROXY_COAP_FILE
 
 if LCZ_LWM2M_GATEWAY_PROXY_COAP_FILE
 
+config LCZ_LWM2M_GATEWAY_PROXY_COAP_BLOCK_SIZE
+	int "CoAP block size"
+	default LCZ_LWM2M_COAP_BLOCK_SIZE
+	range 64 1024
+	help
+	  Size of the buffer for block wise transfers
+
 config LCZ_LWM2M_GATEWAY_PROXY_COAP_FILE_TLS_TAG
 	int "TLS tag to use for file proxy connection"
 	default 0

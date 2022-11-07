@@ -52,7 +52,7 @@ static const uint16_t BLOCK_SIZE[8] = {
 #define BLOCK_MORE 0x8
 
 /* Maximum size of block to support */
-#define PROXY_BLOCK_MAX 128
+#define PROXY_BLOCK_MAX CONFIG_LCZ_LWM2M_GATEWAY_PROXY_COAP_BLOCK_SIZE
 
 /* How often to check cache for expired entries */
 #define MANAGE_CACHE_PERIOD (30 * MSEC_PER_SEC)
