@@ -9,11 +9,10 @@
 /**************************************************************************************************/
 /* Includes                                                                                       */
 /**************************************************************************************************/
-#include <logging/log.h>
+#include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(lcz_lwm2m_ble_central, CONFIG_LCZ_LWM2M_CLIENT_LOG_LEVEL);
 
 #include <fcntl.h>
-#include <zephyr/types.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -21,33 +20,36 @@ LOG_MODULE_REGISTER(lcz_lwm2m_ble_central, CONFIG_LCZ_LWM2M_CLIENT_LOG_LEVEL);
 #include <string.h>
 #include <ctype.h>
 #include <errno.h>
-#include <init.h>
-#include <sys/printk.h>
-#include <posix/sys/eventfd.h>
-#include <bluetooth/conn.h>
-#include <bluetooth/gatt.h>
+#include <zephyr/types.h>
+#include <zephyr/init.h>
+#include <zephyr/sys/printk.h>
+#include <zephyr/posix/sys/eventfd.h>
+#include <zephyr/bluetooth/conn.h>
+#include <zephyr/bluetooth/gatt.h>
 #include <bluetooth/gatt_dm.h>
 #include <bluetooth/services/dfu_smp.h>
 #include <mgmt/mgmt.h>
-#include <mgmt/mcumgr/smp_bt.h>
+#include <zephyr/mgmt/mcumgr/smp_bt.h>
+#include <zephyr/net/lwm2m.h>
 #include <zcbor_common.h>
 #include <zcbor_encode.h>
 #include <zcbor_decode.h>
 #include <zcbor_bulk/zcbor_bulk_priv.h>
-#include <lcz_lwm2m.h>
-
-#include "lcz_bluetooth.h"
-#include "lcz_lwm2m_client.h"
-#include "lcz_lwm2m_gateway_obj.h"
-#include "lcz_lwm2m_gateway_proxy.h"
+#include <lwm2m_transport.h>
+#include <lwm2m_engine.h>
+#include <lcz_bluetooth.h>
+#include <lcz_lwm2m_client.h>
+#include <lcz_lwm2m_gateway_obj.h>
 
 #if defined(CONFIG_ATTR)
-#include "attr.h"
+#include <attr.h>
 #endif
 
 #if defined(CONFIG_LCZ_PKI_AUTH_SMP_CENTRAL)
-#include "lcz_pki_auth_smp.h"
+#include <lcz_pki_auth_smp.h>
 #endif
+
+#include "lcz_lwm2m_gateway_proxy.h"
 
 /**************************************************************************************************/
 /* Local Constant, Macro and Type Definitions                                                     */
@@ -76,7 +78,12 @@ struct queue_entry_t {
 /**************************************************************************************************/
 static int lcz_lwm2m_transport_ble_central_init(const struct device *dev);
 
+static int lwm2m_transport_ble_central_setup(struct lwm2m_ctx *client_ctx, char *url,
+					     bool is_firmware_uri);
+static int lwm2m_transport_ble_central_open(struct lwm2m_ctx *client_ctx);
 static int lwm2m_transport_ble_central_start(struct lwm2m_ctx *client_ctx);
+static int lwm2m_transport_ble_central_suspend(struct lwm2m_ctx *client_ctx, bool should_close);
+static int lwm2m_transport_ble_central_resume(struct lwm2m_ctx *client_ctx);
 static int lwm2m_transport_ble_central_send(struct lwm2m_ctx *client_ctx, const uint8_t *data,
 					    uint32_t datalen);
 static int lwm2m_transport_ble_central_recv(struct lwm2m_ctx *client_ctx);
@@ -112,10 +119,17 @@ static void auth_complete_cb(const bt_addr_le_t *addr, bool status);
 /* Local Data Definitions                                                                         */
 /**************************************************************************************************/
 static const struct lwm2m_transport_procedure ble_central_transport = {
-	lwm2m_transport_ble_central_start,	  lwm2m_transport_ble_central_send,
-	lwm2m_transport_ble_central_recv,	  lwm2m_transport_ble_central_close,
-	lwm2m_transport_ble_central_is_connected, lwm2m_transport_ble_central_tx_pending,
-	lwm2m_transport_ble_central_print_addr,
+	.setup = lwm2m_transport_ble_central_setup,
+	.open = lwm2m_transport_ble_central_open,
+	.start = lwm2m_transport_ble_central_start,
+	.suspend = lwm2m_transport_ble_central_suspend,
+	.resume = lwm2m_transport_ble_central_resume,
+	.close = lwm2m_transport_ble_central_close,
+	.send = lwm2m_transport_ble_central_send,
+	.recv = lwm2m_transport_ble_central_recv,
+	.is_connected = lwm2m_transport_ble_central_is_connected,
+	.tx_pending = lwm2m_transport_ble_central_tx_pending,
+	.print_addr = lwm2m_transport_ble_central_print_addr,
 };
 
 /** @brief BT connection callbacks */
@@ -229,6 +243,33 @@ static void dev_success(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx)
 	}
 }
 
+/** @brief Set up the BLE central transport
+ *
+ * @param[in] client_ctx LwM2M context being set up
+ * @param[in] url Server URL
+ * @param[in] is_firmware_url True if this transport is for a firmware download
+ *
+ * @returns 0 on success, <0 on error
+ */
+static int lwm2m_transport_ble_central_setup(struct lwm2m_ctx *client_ctx, char *url,
+					     bool is_firmware_uri)
+{
+	/* Nothing to do here. Everything is managed in start() */
+	return 0;
+}
+
+/** @brief Open the BLE central transport
+ *
+ * @param[in] client_ctx LwM2M context being opened
+ *
+ * @returns 0 on success, <0 on error
+ */
+static int lwm2m_transport_ble_central_open(struct lwm2m_ctx *client_ctx)
+{
+	/* Nothing to do here. Everything is managed in start() */
+	return 0;
+}
+
 /** @brief Start a BLE central LwM2M transport
  *
  * This function initializes a BLE central LwM2M connection and then
@@ -296,9 +337,37 @@ static int lwm2m_transport_ble_central_start(struct lwm2m_ctx *client_ctx)
 
 			return client_ctx->sock_fd;
 		} else {
+			/* Add the socket to the socket table */
+			lwm2m_sock_table_add(client_ctx);
+
 			return 0;
 		}
 	}
+}
+
+/** @brief Suspend the BLE central transport
+ *
+ * @param[in] client_ctx LwM2M context being suspended
+ * @param[in] should_close True if the socket should be closed, false otherwise
+ *
+ * @returns 0 on success, <0 on error
+ */
+static int lwm2m_transport_ble_central_suspend(struct lwm2m_ctx *client_ctx, bool should_close)
+{
+	/* Nothing to do here. We don't support suspend/resume in this transport. */
+	return 0;
+}
+
+/** @brief Resume the BLE central transport
+ *
+ * @param[in] client_ctx LwM2M context being resumed
+ *
+ * @returns 0 on success, <0 on error
+ */
+static int lwm2m_transport_ble_central_resume(struct lwm2m_ctx *client_ctx)
+{
+	/* Nothing to do here. We don't support suspend/resume in this transport. */
+	return 0;
 }
 
 /** @brief Send data for a BLE central LwM2M context
@@ -437,6 +506,9 @@ static int lwm2m_transport_ble_central_close(struct lwm2m_ctx *client_ctx)
 			k_free(item);
 		}
 	} while (item != NULL);
+
+	/* Remove the socket from the socket table */
+	lwm2m_sock_table_del(client_ctx);
 
 	/* Close the eventfd socket */
 	if (client_ctx->sock_fd >= 0) {

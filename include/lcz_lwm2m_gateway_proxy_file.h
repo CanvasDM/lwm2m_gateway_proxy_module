@@ -12,8 +12,9 @@
 /**************************************************************************************************/
 /* Includes                                                                                       */
 /**************************************************************************************************/
-#include <net/coap.h>
-#include <lcz_lwm2m.h>
+#include <zephyr/net/coap.h>
+#include <zephyr/net/lwm2m.h>
+
 #include "lcz_lwm2m_gateway_proxy.h"
 
 #ifdef __cplusplus

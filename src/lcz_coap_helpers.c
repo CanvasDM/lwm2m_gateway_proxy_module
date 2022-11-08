@@ -9,13 +9,13 @@
 /**************************************************************************************************/
 /* Includes                                                                                       */
 /**************************************************************************************************/
-#include <logging/log.h>
+#include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(lcz_coap_helpers, CONFIG_LCZ_LWM2M_GATEWAY_PROXY_LOG_LEVEL);
 
 #include <stdint.h>
-#include <zephyr.h>
-#include <sys/byteorder.h>
-#include <net/coap.h>
+#include <zephyr/zephyr.h>
+#include <zephyr/sys/byteorder.h>
+#include <zephyr/net/coap.h>
 
 #include "lcz_coap_helpers.h"
 

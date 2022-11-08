@@ -9,24 +9,25 @@
 /**************************************************************************************************/
 /* Includes                                                                                       */
 /**************************************************************************************************/
-#include <logging/log.h>
+#include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(lcz_lwm2m_gateway_proxy, CONFIG_LCZ_LWM2M_GATEWAY_PROXY_LOG_LEVEL);
 
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
-#include <zephyr.h>
-#include <init.h>
-#include <bluetooth/addr.h>
-#include <random/rand32.h>
-#include <net/coap.h>
+#include <zephyr/zephyr.h>
+#include <zephyr/init.h>
+#include <zephyr/bluetooth/addr.h>
+#include <zephyr/random/rand32.h>
+#include <zephyr/net/coap.h>
+#include <zephyr/net/lwm2m.h>
 #include <lwm2m_obj_gateway.h>
-#include <lcz_lwm2m.h>
 
-#include "lcz_coap_helpers.h"
-#include "lcz_lwm2m_client.h"
-#include "lcz_lwm2m_gateway_obj.h"
+#include <lcz_coap_helpers.h>
+#include <lcz_lwm2m_client.h>
+#include <lcz_lwm2m_gateway_obj.h>
+
 #include "lcz_lwm2m_gateway_proxy_file.h"
 #include "lcz_lwm2m_gateway_proxy.h"
 
@@ -363,13 +364,13 @@ static void lwm2m_client_connected(struct lwm2m_ctx *client, int lwm2m_client_in
 					/* Else, close the open context before blocking it */
 
 					/* Close the context and transport */
-					lwm2m_engine_context_close(&(proxy_ctx[i].ctx));
+					lwm2m_engine_stop(&(proxy_ctx[i].ctx));
 
 					/*
-					 * Engine context close will call the BLE central transport close function,
+					 * Engine stop will call the BLE central transport close function,
 					 * which will call our lcz_lwm2m_gateway_proxy_close() function to release
 					 * the proxy context data structure.
-				 	 */
+					 */
 
 					/* Block the context */
 					proxy_ctx[i].flags = CTX_FLAG_STOPPED;
@@ -413,7 +414,7 @@ static uint16_t parse_lifetime(uint8_t *option_value, int option_len)
 	}
 
 	/* Add a small grace period to avoid premature timeouts */
-	return lt + CONFIG_LCZ_LWM2M_SECONDS_TO_UPDATE_EARLY;
+	return lt + CONFIG_LWM2M_SECONDS_TO_UPDATE_EARLY;
 }
 
 /** @brief Handle a registration message from a client
@@ -647,7 +648,7 @@ static void forward_sensor_reply(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx, struct coa
 	/* If this message expects an ACK from the server, add it to a pending list */
 	if (coap_header_get_type(pkt) == COAP_TYPE_CON) {
 		pending = coap_pending_next_unused(pctx->pendings,
-						   CONFIG_LCZ_LWM2M_ENGINE_MAX_PENDING);
+						   CONFIG_LWM2M_ENGINE_MAX_PENDING);
 		if (pending == NULL) {
 			LOG_ERR("Unable to find free pending slot");
 		} else {
@@ -751,11 +752,11 @@ static enum lwm2m_coap_resp transport_coap_msg_cb(struct lwm2m_ctx *client_ctx,
 
 	/* Check for a known prefix from the server */
 	else if (pctx == NULL && n > 1) {
-		uint8_t prefix[CONFIG_LCZ_LWM2M_GATEWAY_PREFIX_MAX_STR_SIZE + 1];
+		uint8_t prefix[CONFIG_LWM2M_GATEWAY_PREFIX_MAX_STR_SIZE + 1];
 
 		/* Copy and nul-terminate the prefix string */
-		if (options[0].len > CONFIG_LCZ_LWM2M_GATEWAY_PREFIX_MAX_STR_SIZE) {
-			options[0].len = CONFIG_LCZ_LWM2M_GATEWAY_PREFIX_MAX_STR_SIZE;
+		if (options[0].len > CONFIG_LWM2M_GATEWAY_PREFIX_MAX_STR_SIZE) {
+			options[0].len = CONFIG_LWM2M_GATEWAY_PREFIX_MAX_STR_SIZE;
 		}
 		memset(prefix, 0, sizeof(prefix));
 		memcpy(prefix, options[0].value, options[0].len);
@@ -788,7 +789,7 @@ static enum lwm2m_coap_resp transport_coap_msg_cb(struct lwm2m_ctx *client_ctx,
 			if ((proxy_ctx[i].flags & CTX_FLAG_ACTIVE) != 0) {
 				pending =
 					coap_pending_received(request, proxy_ctx[i].pendings,
-							      CONFIG_LCZ_LWM2M_ENGINE_MAX_PENDING);
+							      CONFIG_LWM2M_ENGINE_MAX_PENDING);
 				if (pending != NULL) {
 					break;
 				}
@@ -801,7 +802,7 @@ static enum lwm2m_coap_resp transport_coap_msg_cb(struct lwm2m_ctx *client_ctx,
 
 			/* Also check to see if this is a reply we're tracking */
 			reply = coap_response_received(request, NULL, proxy_ctx[i].replies,
-						       CONFIG_LCZ_LWM2M_ENGINE_MAX_REPLIES);
+						       CONFIG_LWM2M_ENGINE_MAX_REPLIES);
 			if (reply != NULL) {
 				coap_reply_clear(reply);
 			}
@@ -865,7 +866,7 @@ static int start_context(int ctx_idx, int dev_idx, uint8_t flags)
 	ret = lwm2m_engine_start(&(proxy_ctx[ctx_idx].ctx));
 	if (ret < 0) {
 		LOG_ERR("Cannot initialize LwM2M proxy context: %d", ret);
-		lwm2m_engine_context_close(&(proxy_ctx[ctx_idx].ctx));
+		lwm2m_engine_stop(&(proxy_ctx[ctx_idx].ctx));
 	} else {
 		/* Start the connection timer */
 		reset_conn_timer(&(proxy_ctx[ctx_idx]));
@@ -929,13 +930,13 @@ static void conn_timeout_work_handler(struct k_work *work)
 	/* If the connection is active, close it */
 	if ((pctx->flags & CTX_FLAG_ACTIVE) != 0) {
 		/* Close the context and transport */
-		lwm2m_engine_context_close(&(pctx->ctx));
+		lwm2m_engine_stop(&(pctx->ctx));
 
 		/*
-		 * Engine context close will call the BLE central transport close function,
+		 * Engine stop will call the BLE central transport close function,
 		 * which will call our lcz_lwm2m_gateway_proxy_close() function to release
 		 * the proxy context data structure.
-	 	 */
+		 */
 	}
 
 	/* Release the mutex */
@@ -957,13 +958,13 @@ static void transport_fault_cb(struct lwm2m_ctx *ctx, int error)
 	}
 
 	/* Close the context and transport */
-	lwm2m_engine_context_close(ctx);
+	lwm2m_engine_stop(ctx);
 
 	/*
-	 * Engine context close will call the BLE central transport close function,
+	 * Engine stop will call the BLE central transport close function,
 	 * which will call our lcz_lwm2m_gateway_proxy_close() function to release
 	 * the proxy context data structure.
- 	 */
+	 */
 }
 
 /** @brief Convert a device index into a proxy connection context index
@@ -1009,13 +1010,13 @@ void obj_deleted(int dev_idx, void *data_ptr)
 	/* Close any context associated with this device */
 	ctx_idx = dev_idx_to_ctx_idx(dev_idx);
 	if (ctx_idx != CTX_IDX_INVALID) {
-		lwm2m_engine_context_close(&(proxy_ctx[ctx_idx].ctx));
+		lwm2m_engine_stop(&(proxy_ctx[ctx_idx].ctx));
 
 		/*
-		 * Engine context close will call the BLE central transport close function,
+		 * Engine stop will call the BLE central transport close function,
 		 * which will call our lcz_lwm2m_gateway_proxy_close() function to release
 		 * the proxy context data structure.
-	 	 */
+		 */
 	}
 
 	/* Free our data */

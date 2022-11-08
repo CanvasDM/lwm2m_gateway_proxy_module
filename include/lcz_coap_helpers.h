@@ -13,7 +13,7 @@
 /* Includes                                                                                       */
 /**************************************************************************************************/
 #include <stdint.h>
-#include <net/coap.h>
+#include <zephyr/net/coap.h>
 
 #ifdef __cplusplus
 extern "C" {

@@ -14,14 +14,14 @@
 /**************************************************************************************************/
 #include <stddef.h>
 #include <stdint.h>
-#include <zephyr.h>
+#include <zephyr/zephyr.h>
 #include <zephyr/types.h>
-#include <bluetooth/addr.h>
+#include <zephyr/bluetooth/addr.h>
 #include <bluetooth/services/dfu_smp.h>
-#include <net/coap.h>
-#include <lcz_lwm2m.h>
+#include <zephyr/net/coap.h>
+#include <zephyr/net/lwm2m.h>
 
-#include "lcz_lwm2m_client.h"
+#include <lcz_lwm2m_client.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -85,8 +85,8 @@ typedef struct {
 	struct lwm2m_gw_smp_buffer *smp_rsp_buff;
 
 	/* Pending messages from the device */
-	struct coap_pending pendings[CONFIG_LCZ_LWM2M_ENGINE_MAX_PENDING];
-	struct coap_reply replies[CONFIG_LCZ_LWM2M_ENGINE_MAX_REPLIES];
+	struct coap_pending pendings[CONFIG_LWM2M_ENGINE_MAX_PENDING];
+	struct coap_reply replies[CONFIG_LWM2M_ENGINE_MAX_REPLIES];
 
 	/* Work for connection timeout */
 	struct k_work_delayable conn_timeout_work;

@@ -10,18 +10,21 @@
 /**************************************************************************************************/
 /* Includes                                                                                       */
 /**************************************************************************************************/
-#include <logging/log.h>
+#include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(lcz_lwm2m_gateway_proxy_file, CONFIG_LCZ_LWM2M_GATEWAY_PROXY_LOG_LEVEL);
 
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
-#include <net/coap.h>
-#include <lcz_lwm2m.h>
-#include <file_system_utilities.h>
+#include <zephyr/net/coap.h>
+#include <zephyr/net/lwm2m.h>
+#include <lwm2m_engine.h>
+#include <lwm2m_transport.h>
 
-#include "lcz_coap_helpers.h"
-#include "lcz_lwm2m_fw_update.h"
+#include <file_system_utilities.h>
+#include <lcz_coap_helpers.h>
+#include <lcz_lwm2m_fw_update.h>
+
 #include "lcz_lwm2m_gateway_proxy.h"
 #include "lcz_lwm2m_gateway_proxy_file.h"
 
@@ -103,7 +106,7 @@ enum lwm2m_coap_resp lcz_lwm2m_gateway_file_proxy_request(LCZ_LWM2M_GATEWAY_PROX
 							  struct coap_packet *ack)
 {
 	PROXY_CACHE_ENTRY_T *entry;
-	uint8_t uri[CONFIG_LCZ_LWM2M_SWMGMT_PACKAGE_URI_LEN];
+	uint8_t uri[CONFIG_LWM2M_SWMGMT_PACKAGE_URI_LEN];
 	enum lwm2m_coap_resp ret = LWM2M_COAP_RESP_NONE;
 
 	if (lcz_coap_find_proxy_uri(request, uri, sizeof(uri)) == false) {
@@ -181,20 +184,22 @@ enum lwm2m_coap_resp lcz_lwm2m_gateway_file_proxy_request(LCZ_LWM2M_GATEWAY_PROX
 /** @brief Start a CoAP file proxy session with the network CoAP proxy */
 static void coap_file_proxy_start(void)
 {
-	static char proxy_uri[CONFIG_LCZ_LWM2M_SWMGMT_PACKAGE_URI_LEN];
+	static char proxy_uri[CONFIG_LWM2M_SWMGMT_PACKAGE_URI_LEN];
 	int ret = 0;
 	const char *server_addr;
 
+	/* Initialize the transport */
 	memset(&coap_file_proxy_ctx, 0, sizeof(coap_file_proxy_ctx));
 	coap_file_proxy_ctx.transport_name = "udp";
 	coap_file_proxy_ctx.load_credentials = lcz_lwm2m_fw_update_load_certs;
 	coap_file_proxy_ctx.tls_tag = CONFIG_LCZ_LWM2M_GATEWAY_PROXY_COAP_FILE_TLS_TAG;
+	lwm2m_engine_context_init(&coap_file_proxy_ctx);
 
 	server_addr = lwm2m_firmware_get_proxy_uri();
 	if (server_addr == NULL) {
 		LOG_ERR("Proxy URI is required for CoAP proxy");
 		ret = -EINVAL;
-	} else if (strlen(server_addr) >= CONFIG_LCZ_LWM2M_SWMGMT_PACKAGE_URI_LEN) {
+	} else if (strlen(server_addr) >= CONFIG_LWM2M_SWMGMT_PACKAGE_URI_LEN) {
 		LOG_ERR("Proxy URI too long: %s", server_addr);
 		ret = -EINVAL;
 	}
@@ -203,33 +208,18 @@ static void coap_file_proxy_start(void)
 		/* Copy required as it gets modified when port is available */
 		strcpy(proxy_uri, server_addr);
 
-		/* Parse the URL */
-		ret = lwm2m_parse_peerinfo(proxy_uri, &coap_file_proxy_ctx, true);
+		/* Load the URI */
+		ret = lwm2m_transport_setup(&coap_file_proxy_ctx, proxy_uri, true);
 		if (ret < 0) {
 			LOG_ERR("Failed to parse server URI.");
 		}
 	}
 
-	/* Initialize the transport */
+	/* Start the transport */
 	if (ret >= 0) {
-		ret = lwm2m_transport_lookup(&coap_file_proxy_ctx);
+		ret = lwm2m_transport_start(&coap_file_proxy_ctx);
 		if (ret < 0) {
-			LOG_ERR("Could not initialize UDP LwM2M transport: %d", ret);
-		}
-	}
-
-	if (ret >= 0) {
-		lwm2m_engine_context_init(&coap_file_proxy_ctx);
-		ret = lwm2m_socket_start(&coap_file_proxy_ctx);
-		if (ret < 0) {
-			LOG_ERR("Cannot start a firmware-pull connection: %d", ret);
-		}
-	}
-
-	if (ret >= 0) {
-		ret = lwm2m_socket_add(&coap_file_proxy_ctx);
-		if (ret < 0) {
-			LOG_ERR("Cannot add LwM2M socket: %d", ret);
+			LOG_ERR("Cannot start a firmware-pull connection:%d", ret);
 		}
 	}
 
@@ -255,7 +245,7 @@ static void file_proxy_timeout_work_handler(struct k_work *work)
 	k_mutex_lock(&file_proxy_mutex, K_FOREVER);
 
 	/* Close the proxy context */
-	lwm2m_engine_context_close(&coap_file_proxy_ctx);
+	lwm2m_engine_stop(&coap_file_proxy_ctx);
 
 	/* Clear the flag */
 	coap_file_proxy_running = false;
@@ -561,8 +551,7 @@ static int forward_request(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx, PROXY_CACHE_ENTR
 
 	/* If this message expects an ACK from the server, add it to a pending list */
 	if (coap_header_get_type(request) == COAP_TYPE_CON) {
-		pending = coap_pending_next_unused(pctx->pendings,
-						   CONFIG_LCZ_LWM2M_ENGINE_MAX_PENDING);
+		pending = coap_pending_next_unused(pctx->pendings, CONFIG_LWM2M_ENGINE_MAX_PENDING);
 		if (pending == NULL) {
 			LOG_ERR("Unable to find free pending slot");
 			ret = -ENOMEM;
@@ -576,7 +565,7 @@ static int forward_request(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx, PROXY_CACHE_ENTR
 		}
 
 		/* Also track the reply to this message */
-		reply = coap_reply_next_unused(pctx->replies, CONFIG_LCZ_LWM2M_ENGINE_MAX_REPLIES);
+		reply = coap_reply_next_unused(pctx->replies, CONFIG_LWM2M_ENGINE_MAX_REPLIES);
 		if (reply == NULL) {
 			LOG_ERR("Unable to find free reply slot");
 			ret = -ENOMEM;
