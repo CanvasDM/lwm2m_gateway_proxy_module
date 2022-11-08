@@ -64,7 +64,7 @@ if LCZ_LWM2M_GATEWAY_PROXY_COAP_FILE
 
 config LCZ_LWM2M_GATEWAY_PROXY_COAP_BLOCK_SIZE
 	int "CoAP block size"
-	default LCZ_LWM2M_COAP_BLOCK_SIZE
+	default LWM2M_COAP_BLOCK_SIZE
 	range 64 1024
 	help
 	  Size of the buffer for block wise transfers
