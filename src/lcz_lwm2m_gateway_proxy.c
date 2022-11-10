@@ -60,6 +60,9 @@ struct coap_queue_entry_t {
 	uint8_t pkt_data[1]; /* Variable-sized array */
 };
 
+/* Delay from end of one connection to attempting to open another */
+#define START_DELAY K_SECONDS(5)
+
 /**************************************************************************************************/
 /* Local Function Prototypes                                                                      */
 /**************************************************************************************************/
@@ -101,7 +104,7 @@ static struct lcz_lwm2m_client_event_callback_agent lwm2m_event_agent = {
 	.connected_callback = lwm2m_client_connected
 };
 
-static K_WORK_DEFINE(connection_start_work, connection_start_work_handler);
+static K_WORK_DELAYABLE_DEFINE(connection_start_work, connection_start_work_handler);
 
 /**************************************************************************************************/
 /* Global Function Definitions                                                                    */
@@ -178,6 +181,9 @@ void lcz_lwm2m_gateway_proxy_device_ready(const bt_addr_le_t *addr, bool coded_p
 				/* Generate a new random tunnel ID for this device */
 				sys_rand_get(&(pdev->tunnel_id), sizeof(pdev->tunnel_id));
 
+				/* Initialize the flags */
+				pdev->flags = 0;
+
 				/* Limit tunnel ID to 31 bits */
 				pdev->tunnel_id &= TUNNEL_ID_MASK;
 
@@ -204,11 +210,15 @@ void lcz_lwm2m_gateway_proxy_device_ready(const bt_addr_le_t *addr, bool coded_p
 
 		/* If no existing context, try to open one */
 		if (ctx_idx == CTX_IDX_INVALID) {
-			/* Set the data ready flag for the device */
-			pdev->flags |= DEV_FLAG_DATA_READY;
+			if ((pdev->flags & DEV_FLAG_DATA_READY) == 0) {
+				/* Set the data ready flag for the device */
+				pdev->flags |= DEV_FLAG_DATA_READY;
 
-			/* Schedule the work to start a connection */
-			k_work_submit(&connection_start_work);
+				/* Schedule the work to start a connection */
+				if (!k_work_delayable_is_pending(&connection_start_work)) {
+					k_work_reschedule(&connection_start_work, START_DELAY);
+				}
+			}
 		}
 	}
 
@@ -237,7 +247,7 @@ void lcz_lwm2m_gateway_proxy_close(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx)
 	}
 
 	/* Schedule work to find another device that needs service */
-	k_work_submit(&connection_start_work);
+	k_work_reschedule(&connection_start_work, START_DELAY);
 
 	/* Release the mutex */
 	k_mutex_unlock(&proxy_mutex);
@@ -324,6 +334,9 @@ static void lwm2m_client_connected(struct lwm2m_ctx *client, int lwm2m_client_in
 					proxy_ctx[i].flags = 0;
 				}
 			}
+
+			/* Now that we're unblocked, see if we need to start a connection */
+			k_work_reschedule(&connection_start_work, START_DELAY);
 		} else {
 			/* Block the client contexts */
 			for (i = 0; i < CONFIG_LCZ_LWM2M_GATEWAY_PROXY_NUM_CONTEXTS; i++) {
@@ -577,7 +590,9 @@ static void forward_prefixed_message(int dev_idx, struct coap_packet *pkt)
 			add_to_queue(&(pdev->tx_queue), pkt);
 
 			/* Schedule the work to start a connection */
-			k_work_submit(&connection_start_work);
+			if (!k_work_delayable_is_pending(&connection_start_work)) {
+				k_work_reschedule(&connection_start_work, START_DELAY);
+			}
 		}
 	}
 
