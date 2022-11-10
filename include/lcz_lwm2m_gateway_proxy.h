@@ -30,6 +30,9 @@ extern "C" {
 /**************************************************************************************************/
 /* Global Constants, Macros and Type Definitions                                                  */
 /**************************************************************************************************/
+/* Device data flag definitions */
+#define DEV_FLAG_DATA_READY 0x01
+
 /* Proxy context flag definitions */
 #define CTX_FLAG_ACTIVE 0x01
 #define CTX_FLAG_INCOMING 0x02
@@ -53,6 +56,9 @@ typedef struct {
 
 	/* Count of repeated connection failures */
 	uint32_t failure_count;
+
+	/* Device flags */
+	uint8_t flags;
 
 	/* Current PHY in use by the device */
 	bool coded_phy;

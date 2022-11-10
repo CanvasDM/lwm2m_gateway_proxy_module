@@ -86,6 +86,7 @@ static int add_to_queue(struct k_fifo *queue, struct coap_packet *pkt);
 static void conn_timeout_work_handler(struct k_work *work);
 static void transport_fault_cb(struct lwm2m_ctx *ctx, int error);
 static int dev_idx_to_ctx_idx(int dev_idx);
+static void connection_start_work_handler(struct k_work *work);
 
 /**************************************************************************************************/
 /* Local Data Definitions                                                                         */
@@ -99,6 +100,8 @@ static struct lcz_lwm2m_client_event_callback_agent lwm2m_event_agent = {
 	.event_callback = NULL,
 	.connected_callback = lwm2m_client_connected
 };
+
+static K_WORK_DEFINE(connection_start_work, connection_start_work_handler);
 
 /**************************************************************************************************/
 /* Global Function Definitions                                                                    */
@@ -201,11 +204,11 @@ void lcz_lwm2m_gateway_proxy_device_ready(const bt_addr_le_t *addr, bool coded_p
 
 		/* If no existing context, try to open one */
 		if (ctx_idx == CTX_IDX_INVALID) {
-			/* Check to see if we have an open context to use for this device */
-			ctx_idx = find_open_context();
-			if (ctx_idx >= 0) {
-				start_context(ctx_idx, dev_idx, CTX_FLAG_INCOMING);
-			}
+			/* Set the data ready flag for the device */
+			pdev->flags |= DEV_FLAG_DATA_READY;
+
+			/* Schedule the work to start a connection */
+			k_work_submit(&connection_start_work);
 		}
 	}
 
@@ -213,25 +216,9 @@ void lcz_lwm2m_gateway_proxy_device_ready(const bt_addr_le_t *addr, bool coded_p
 	k_mutex_unlock(&proxy_mutex);
 }
 
-void foreach_pending_tx(int idx, void *dm_ptr, void *telem_ptr, void *priv)
-{
-	LCZ_LWM2M_GATEWAY_PROXY_DEV_T *pdev = (LCZ_LWM2M_GATEWAY_PROXY_DEV_T *)dm_ptr;
-	int *dev_idx_ptr = (int *)priv;
-
-	/* Find the first device that has a non-empty FIFO */
-	if (dev_idx_ptr != NULL && *dev_idx_ptr == DEV_IDX_INVALID && pdev != NULL) {
-		if (!k_fifo_is_empty(&(pdev->tx_queue))) {
-			*dev_idx_ptr = idx;
-		}
-	}
-}
-
 void lcz_lwm2m_gateway_proxy_close(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx)
 {
-	int dev_idx;
 	int ctx_idx = (pctx - proxy_ctx) / sizeof(proxy_ctx[0]);
-	struct coap_queue_entry_t *item;
-	LCZ_LWM2M_GATEWAY_PROXY_DEV_T *pdev;
 
 	/* Acquire a mutex lock for our data */
 	k_mutex_lock(&proxy_mutex, K_FOREVER);
@@ -249,25 +236,8 @@ void lcz_lwm2m_gateway_proxy_close(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx)
 		k_mutex_unlock(&(pctx->lock));
 	}
 
-	/* Try to find a device that has pending data in its queue */
-	dev_idx = DEV_IDX_INVALID;
-	(void)lcz_lwm2m_gw_obj_foreach(foreach_pending_tx, &dev_idx);
-
-	/* Conect to the device and send the contents of the TX queue */
-	if (dev_idx != DEV_IDX_INVALID) {
-		pdev = lcz_lwm2m_gw_obj_get_dm_data(dev_idx);
-
-		if (start_context(ctx_idx, dev_idx, 0) == 0) {
-			do {
-				item = k_fifo_get(&(pdev->tx_queue), K_NO_WAIT);
-				if (item != NULL) {
-					lwm2m_engine_send_coap(&(proxy_ctx[ctx_idx].ctx),
-							       &(item->pkt));
-					k_free(item);
-				}
-			} while (item != NULL);
-		}
-	}
+	/* Schedule work to find another device that needs service */
+	k_work_submit(&connection_start_work);
 
 	/* Release the mutex */
 	k_mutex_unlock(&proxy_mutex);
@@ -328,7 +298,7 @@ static int find_open_context(void)
  *
  * @param[in] client LwM2M engine context
  * @param[in] lwm2m_client_index LwM2M client index
- * @param[in] connnected true if the connection is connected, false if not
+ * @param[in] connected true if the connection is connected, false if not
  * @param[in] event LwM2M RD client event that caused the state change
  */
 static void lwm2m_client_connected(struct lwm2m_ctx *client, int lwm2m_client_index, bool connected,
@@ -421,7 +391,7 @@ static uint16_t parse_lifetime(uint8_t *option_value, int option_len)
  *
  * @param[in] client_ctx LwM2M client context on which the message was received
  * @param[in] request Received CoAP message
- * @param[out] ack Pointer to CoAP ACK message to be used as the resplt
+ * @param[out] ack Pointer to CoAP ACK message to be used as the result
  *
  * @returns LWM2M_COAP_RESP_NONE if no reply should be sent, LWM2M_COAP_RESP_ACK if
  * the CoAP ACK message was populated and should be sent as a reply, or
@@ -486,7 +456,7 @@ static enum lwm2m_coap_resp handle_registration(struct lwm2m_ctx *client_ctx,
 		coap_packet_append_option(ack, COAP_OPTION_LOCATION_PATH, REGISTRATION_PATH,
 					  strlen(REGISTRATION_PATH));
 
-		/* Use the prefix as the registration identifer back to the client */
+		/* Use the prefix as the registration identifier back to the client */
 		coap_packet_append_option(ack, COAP_OPTION_LOCATION_PATH, prefix, strlen(prefix));
 
 		/* Send the ACK that we built */
@@ -582,7 +552,7 @@ static enum lwm2m_coap_resp handle_registration_update(struct lwm2m_ctx *client_
  * send the received message to the client device.
  *
  * @param[in] dev_idx Device to which the message should be sent
- * @param[in] pkt Recevied CoAP message
+ * @param[in] pkt Received CoAP message
  */
 static void forward_prefixed_message(int dev_idx, struct coap_packet *pkt)
 {
@@ -600,19 +570,14 @@ static void forward_prefixed_message(int dev_idx, struct coap_packet *pkt)
 	/* Find the context associated with the device */
 	ctx_idx = dev_idx_to_ctx_idx(dev_idx);
 
-	/* If no current context, see if a context can be created */
-	if (ctx_idx == CTX_IDX_INVALID) {
-		ctx_idx = find_open_context();
-		if (ctx_idx >= 0 && start_context(ctx_idx, dev_idx, 0) < 0) {
-			ctx_idx = CTX_IDX_INVALID;
-		}
-	}
-
-	/* If a context cannot be created, add the message to the device's FIFO */
+	/* If no current context, add the message to the device's FIFO */
 	if (ctx_idx == CTX_IDX_INVALID) {
 		if (pdev != NULL) {
 			/* Add the packet to the device's queue */
 			add_to_queue(&(pdev->tx_queue), pkt);
+
+			/* Schedule the work to start a connection */
+			k_work_submit(&connection_start_work);
 		}
 	}
 
@@ -647,8 +612,7 @@ static void forward_sensor_reply(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx, struct coa
 
 	/* If this message expects an ACK from the server, add it to a pending list */
 	if (coap_header_get_type(pkt) == COAP_TYPE_CON) {
-		pending = coap_pending_next_unused(pctx->pendings,
-						   CONFIG_LWM2M_ENGINE_MAX_PENDING);
+		pending = coap_pending_next_unused(pctx->pendings, CONFIG_LWM2M_ENGINE_MAX_PENDING);
 		if (pending == NULL) {
 			LOG_ERR("Unable to find free pending slot");
 		} else {
@@ -763,7 +727,7 @@ static enum lwm2m_coap_resp transport_coap_msg_cb(struct lwm2m_ctx *client_ctx,
 
 		i = lcz_lwm2m_gw_obj_lookup_path(prefix);
 		if (i >= 0) {
-			/* Foward the message to the sensor */
+			/* Forward the message to the sensor */
 			forward_prefixed_message(i, request);
 
 			/* Do nothing else with the message in this context */
@@ -787,9 +751,8 @@ static enum lwm2m_coap_resp transport_coap_msg_cb(struct lwm2m_ctx *client_ctx,
 
 		for (i = 0; i < CONFIG_LCZ_LWM2M_GATEWAY_PROXY_NUM_CONTEXTS; i++) {
 			if ((proxy_ctx[i].flags & CTX_FLAG_ACTIVE) != 0) {
-				pending =
-					coap_pending_received(request, proxy_ctx[i].pendings,
-							      CONFIG_LWM2M_ENGINE_MAX_PENDING);
+				pending = coap_pending_received(request, proxy_ctx[i].pendings,
+								CONFIG_LWM2M_ENGINE_MAX_PENDING);
 				if (pending != NULL) {
 					break;
 				}
@@ -1003,7 +966,7 @@ static int dev_idx_to_ctx_idx(int dev_idx)
  * @param[in] dev_idx Index of the device that is being deleted
  * @param[in] data_ptr Our private data pointer associated with the device
  */
-void obj_deleted(int dev_idx, void *data_ptr)
+static void obj_deleted(int dev_idx, void *data_ptr)
 {
 	int ctx_idx;
 
@@ -1023,6 +986,93 @@ void obj_deleted(int dev_idx, void *data_ptr)
 	if (data_ptr != NULL) {
 		k_free(data_ptr);
 	}
+}
+
+/** @brief Helper function to find devices with pending data
+ *
+ * This function is called for each device in the gateway object database.
+ *
+ * @param[in] idx Device index of the device being inspected
+ * @param[in] dm_ptr Pointer to DM private data for the device
+ * @param[in] telem_ptr Pointer to the telemetry private data for the device
+ * @param[in] priv Private data pointer passed into lcz_lwm2m_gw_obj_foreach()
+ */
+static void foreach_pending_tx(int idx, void *dm_ptr, void *telem_ptr, void *priv)
+{
+	LCZ_LWM2M_GATEWAY_PROXY_DEV_T *pdev = (LCZ_LWM2M_GATEWAY_PROXY_DEV_T *)dm_ptr;
+	int *dev_idx_ptr = (int *)priv;
+
+	/* Only check if we haven't already found a good device */
+	if (dev_idx_ptr != NULL && *dev_idx_ptr == DEV_IDX_INVALID && pdev != NULL) {
+		/* If this device has a non-empty queue, select it */
+		if (!k_fifo_is_empty(&(pdev->tx_queue))) {
+			*dev_idx_ptr = idx;
+		}
+
+		/* If we've received an advertisement from this device, select it */
+		if ((pdev->flags & DEV_FLAG_DATA_READY) != 0) {
+			*dev_idx_ptr = idx;
+		}
+	}
+}
+
+/** @brief Work handler function for starting connections
+ *
+ * The system workqueue is used for this work function. The main requirement is that
+ * the connection establishment does not occur in the context of the BLE RX thread,
+ * so the system workqueue is a reasonable context.
+ *
+ * @param[in] work Pointer to work queue item
+ */
+static void connection_start_work_handler(struct k_work *work)
+{
+	int dev_idx;
+	int ctx_idx;
+	uint8_t flags;
+	struct coap_queue_entry_t *item;
+	LCZ_LWM2M_GATEWAY_PROXY_DEV_T *pdev;
+
+	/* Acquire a mutex lock for our data */
+	k_mutex_lock(&proxy_mutex, K_FOREVER);
+
+	/* Find open connection contexts to use */
+	while ((ctx_idx = find_open_context()) != CTX_IDX_INVALID) {
+		/* Try to find a device that needs servicing */
+		dev_idx = DEV_IDX_INVALID;
+		(void)lcz_lwm2m_gw_obj_foreach(foreach_pending_tx, &dev_idx);
+
+		/* Connect to the device we found */
+		if (dev_idx != DEV_IDX_INVALID) {
+			pdev = lcz_lwm2m_gw_obj_get_dm_data(dev_idx);
+
+			/* Set context flags */
+			flags = 0;
+			if ((pdev->flags & DEV_FLAG_DATA_READY) != 0) {
+				flags |= CTX_FLAG_INCOMING;
+			}
+
+			if (start_context(ctx_idx, dev_idx, flags) == 0) {
+				/* Clear the data ready flag for this device */
+				pdev->flags &= ~DEV_FLAG_DATA_READY;
+
+				/* Send everything in our TX queue */
+				do {
+					item = k_fifo_get(&(pdev->tx_queue), K_NO_WAIT);
+					if (item != NULL) {
+						lwm2m_engine_send_coap(&(proxy_ctx[ctx_idx].ctx),
+								       &(item->pkt));
+						k_free(item);
+					}
+				} while (item != NULL);
+			}
+		} else {
+			/* No more devices that need servicing */
+			break;
+		}
+	}
+
+	/* Release the mutex */
+	k_mutex_unlock(&proxy_mutex);
 }
 
 SYS_INIT(lcz_lwm2m_gateway_proxy_init, APPLICATION, CONFIG_LCZ_LWM2M_GATEWAY_PROXY_INIT_PRIORITY);
