@@ -1079,6 +1079,10 @@ static void connection_start_work_handler(struct k_work *work)
 						k_free(item);
 					}
 				} while (item != NULL);
+			} else {
+				/* Start failed. Try again later */
+				k_work_reschedule(&connection_start_work, START_DELAY);
+				break;
 			}
 		} else {
 			/* No more devices that need servicing */
