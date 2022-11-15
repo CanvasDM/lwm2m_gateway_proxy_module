@@ -241,7 +241,9 @@ void lcz_lwm2m_gateway_proxy_close(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx)
 		k_work_cancel_delayable(&(pctx->conn_timeout_work));
 
 		pctx->dev_idx = DEV_IDX_INVALID;
-		pctx->flags = 0;
+
+		/* Reset the flags, but never clear the stopped flag */
+		pctx->flags &= CTX_FLAG_STOPPED;
 
 		k_mutex_unlock(&(pctx->lock));
 	}

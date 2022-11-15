@@ -328,13 +328,14 @@ static int lwm2m_transport_ble_central_start(struct lwm2m_ctx *client_ctx)
 		if (client_ctx->sock_fd < 0) {
 			LOG_ERR("Failed to create eventfd socket: %d", client_ctx->sock_fd);
 
-			bt_conn_disconnect(pctx->active_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-			bt_conn_unref(pctx->active_conn);
-			pctx->active_conn = NULL;
-
 			/* Report the error */
 			dev_error(pctx, false);
 
+			/*
+			 * Returning an error will cause the proxy code to call lwm2m_engine_stop,
+			 * which will cause our transport close function to close the BLE
+			 * connection.
+			 */
 			return client_ctx->sock_fd;
 		} else {
 			/* Add the socket to the socket table */
@@ -519,17 +520,15 @@ static int lwm2m_transport_ble_central_close(struct lwm2m_ctx *client_ctx)
 	/* If we still have a BLE connection, close it */
 	if (pctx->active_conn != NULL) {
 		bt_conn_disconnect(pctx->active_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-
-		/* Release our reference to the connection */
-		bt_conn_unref(pctx->active_conn);
-		pctx->active_conn = NULL;
 	}
 
 	/* Release the mutex lock for our data */
 	k_mutex_unlock(&(pctx->lock));
 
-	/* Release the context */
-	lcz_lwm2m_gateway_proxy_close(pctx);
+	/* Close the context if the BLE connection is already closed */
+	if (pctx->active_conn == NULL) {
+		lcz_lwm2m_gateway_proxy_close(pctx);
+	}
 
 	return 0;
 }
@@ -1695,9 +1694,15 @@ static void bt_disconnected(struct bt_conn *conn, uint8_t reason)
 		bt_conn_unref(conn);
 		pctx->active_conn = NULL;
 
-		/* Call the error callback to get the transport closed */
-		if (pctx->ctx.fault_cb != NULL) {
-			pctx->ctx.fault_cb(&(pctx->ctx), 0);
+		/* Check to see who closed the connection */
+		if (reason == BT_HCI_ERR_LOCALHOST_TERM_CONN) {
+			/* We closed it, so just close the proxy context */
+			lcz_lwm2m_gateway_proxy_close(pctx);
+		} else {
+			/* Call the error callback to get the transport closed */
+			if (pctx->ctx.fault_cb != NULL) {
+				pctx->ctx.fault_cb(&(pctx->ctx), 0);
+			}
 		}
 	}
 }
