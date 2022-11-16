@@ -60,6 +60,12 @@ struct coap_queue_entry_t {
 	uint8_t pkt_data[1]; /* Variable-sized array */
 };
 
+struct device_ready_queue_entry_t {
+	void *fifo_reserved;
+	bt_addr_le_t addr;
+	bool coded_phy;
+};
+
 /* Delay from end of one connection to attempting to open another */
 #define START_DELAY K_SECONDS(5)
 
@@ -89,6 +95,7 @@ static int add_to_queue(struct k_fifo *queue, struct coap_packet *pkt);
 static void conn_timeout_work_handler(struct k_work *work);
 static void transport_fault_cb(struct lwm2m_ctx *ctx, int error);
 static int dev_idx_to_ctx_idx(int dev_idx);
+static void device_ready_work_handler(struct k_work *work);
 static void connection_start_work_handler(struct k_work *work);
 
 /**************************************************************************************************/
@@ -96,6 +103,9 @@ static void connection_start_work_handler(struct k_work *work);
 /**************************************************************************************************/
 static K_MUTEX_DEFINE(proxy_mutex);
 static LCZ_LWM2M_GATEWAY_PROXY_CTX_T proxy_ctx[CONFIG_LCZ_LWM2M_GATEWAY_PROXY_NUM_CONTEXTS];
+
+static K_FIFO_DEFINE(device_ready_fifo);
+static K_WORK_DEFINE(device_ready_work, device_ready_work_handler);
 
 static struct lwm2m_ctx *server_context = NULL;
 
@@ -152,78 +162,21 @@ LCZ_LWM2M_GATEWAY_PROXY_CTX_T *lcz_lwm2m_gateway_proxy_addr_to_context(const bt_
 
 void lcz_lwm2m_gateway_proxy_device_ready(const bt_addr_le_t *addr, bool coded_phy)
 {
-	LCZ_LWM2M_GATEWAY_PROXY_DEV_T *pdev;
-	int dev_idx;
-	int ctx_idx;
+	struct device_ready_queue_entry_t *entry;
 
-	/* Acquire a mutex lock for our data */
-	k_mutex_lock(&proxy_mutex, K_FOREVER);
+	/* Allocate a new queue entry */
+	entry = k_malloc(sizeof(struct device_ready_queue_entry_t));
+	if (entry != NULL) {
+		/* Fill in the queue entry */
+		memcpy(&(entry->addr), addr, sizeof(bt_addr_le_t));
+		entry->coded_phy = coded_phy;
 
-	/* Find the device in the object database */
-	dev_idx = lcz_lwm2m_gw_obj_lookup_ble(addr);
+		/* Add it to the device ready queue */
+		k_fifo_put(&device_ready_fifo, entry);
 
-	/* If we didn't find the device in our database, try to add it */
-	if (dev_idx < 0) {
-		dev_idx = lcz_lwm2m_gw_obj_create(addr);
+		/* Queue the work handler */
+		k_work_submit(&device_ready_work);
 	}
-
-	if (dev_idx != DEV_IDX_INVALID) {
-		/* Allocate our DM-specific data for the device if we haven't yet */
-		pdev = lcz_lwm2m_gw_obj_get_dm_data(dev_idx);
-		if (pdev == NULL) {
-			/* Allocate memory for DM-specific data */
-			pdev = (LCZ_LWM2M_GATEWAY_PROXY_DEV_T *)k_malloc(
-				sizeof(LCZ_LWM2M_GATEWAY_PROXY_DEV_T));
-			if (pdev == NULL) {
-				LOG_ERR("Failed to allocate DM device data");
-				dev_idx = DEV_IDX_INVALID;
-			} else {
-				/* Generate a new random tunnel ID for this device */
-				sys_rand_get(&(pdev->tunnel_id), sizeof(pdev->tunnel_id));
-
-				/* Initialize the flags */
-				pdev->flags = 0;
-
-				/* Limit tunnel ID to 31 bits */
-				pdev->tunnel_id &= TUNNEL_ID_MASK;
-
-				/* Reset the failure count */
-				pdev->failure_count = 0;
-
-				/* Initialize the TX queue */
-				k_fifo_init(&(pdev->tx_queue));
-
-				/* Attach the DM-specific data to the gateway object */
-				lcz_lwm2m_gw_obj_set_dm_data(dev_idx, pdev);
-			}
-		}
-
-		/* Store the current device PHY in the device record */
-		if (pdev != NULL) {
-			pdev->coded_phy = coded_phy;
-		}
-	}
-
-	if (dev_idx != DEV_IDX_INVALID) {
-		/* See if we already have an open context for this device (unlikely) */
-		ctx_idx = dev_idx_to_ctx_idx(dev_idx);
-
-		/* If no existing context, try to open one */
-		if (ctx_idx == CTX_IDX_INVALID) {
-			if ((pdev->flags & DEV_FLAG_DATA_READY) == 0) {
-				/* Set the data ready flag for the device */
-				pdev->flags |= DEV_FLAG_DATA_READY;
-
-				/* Schedule the work to start a connection */
-				if (!k_work_delayable_is_pending(&connection_start_work)) {
-					k_work_reschedule(&connection_start_work, START_DELAY);
-				}
-			}
-		}
-	}
-
-	/* Release the mutex */
-	k_mutex_unlock(&proxy_mutex);
 }
 
 void lcz_lwm2m_gateway_proxy_close(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx)
@@ -346,7 +299,8 @@ static void lwm2m_client_connected(struct lwm2m_ctx *client, int lwm2m_client_in
 				if ((proxy_ctx[i].flags & CTX_FLAG_ACTIVE) == 0) {
 					proxy_ctx[i].flags = CTX_FLAG_STOPPED;
 				} else {
-					/* Else, close the open context before blocking it */
+					/* Block the context */
+					proxy_ctx[i].flags |= CTX_FLAG_STOPPED;
 
 					/* Close the context and transport */
 					lwm2m_engine_stop(&(proxy_ctx[i].ctx));
@@ -356,9 +310,6 @@ static void lwm2m_client_connected(struct lwm2m_ctx *client, int lwm2m_client_in
 					 * which will call our lcz_lwm2m_gateway_proxy_close() function to release
 					 * the proxy context data structure.
 					 */
-
-					/* Block the context */
-					proxy_ctx[i].flags = CTX_FLAG_STOPPED;
 				}
 			}
 		}
@@ -1031,6 +982,97 @@ static void foreach_pending_tx(int idx, void *dm_ptr, void *telem_ptr, void *pri
 			*dev_idx_ptr = idx;
 		}
 	}
+}
+
+/** @brief Work handler for device ready indications
+ *
+ * The system workqueue is used for this work function. This gets scheduled whenever
+ * an advertisement is received indicating that a device needing a DM connection
+ * has been added to the device_ready FIFO.
+ *
+ * @param[in] work Pointer to work queue item
+ */
+static void device_ready_work_handler(struct k_work *work)
+{
+	struct device_ready_queue_entry_t *entry;
+	LCZ_LWM2M_GATEWAY_PROXY_DEV_T *pdev;
+	int dev_idx;
+	int ctx_idx;
+
+	/* Acquire a mutex lock for our data */
+	k_mutex_lock(&proxy_mutex, K_FOREVER);
+
+	while ((entry = k_fifo_get(&device_ready_fifo, K_NO_WAIT)) != NULL) {
+		/* Find the device in the object database */
+		dev_idx = lcz_lwm2m_gw_obj_lookup_ble(&(entry->addr));
+
+		/* If we didn't find the device in our database, try to add it */
+		if (dev_idx < 0) {
+			dev_idx = lcz_lwm2m_gw_obj_create(&(entry->addr));
+		}
+
+		if (dev_idx != DEV_IDX_INVALID) {
+			/* Allocate our DM-specific data for the device if we haven't yet */
+			pdev = lcz_lwm2m_gw_obj_get_dm_data(dev_idx);
+			if (pdev == NULL) {
+				/* Allocate memory for DM-specific data */
+				pdev = (LCZ_LWM2M_GATEWAY_PROXY_DEV_T *)k_malloc(
+					sizeof(LCZ_LWM2M_GATEWAY_PROXY_DEV_T));
+				if (pdev == NULL) {
+					LOG_ERR("Failed to allocate DM device data");
+					dev_idx = DEV_IDX_INVALID;
+				} else {
+					/* Generate a new random tunnel ID for this device */
+					sys_rand_get(&(pdev->tunnel_id), sizeof(pdev->tunnel_id));
+
+					/* Initialize the flags */
+					pdev->flags = 0;
+
+					/* Limit tunnel ID to 31 bits */
+					pdev->tunnel_id &= TUNNEL_ID_MASK;
+
+					/* Reset the failure count */
+					pdev->failure_count = 0;
+
+					/* Initialize the TX queue */
+					k_fifo_init(&(pdev->tx_queue));
+
+					/* Attach the DM-specific data to the gateway object */
+					lcz_lwm2m_gw_obj_set_dm_data(dev_idx, pdev);
+				}
+			}
+
+			/* Store the current device PHY in the device record */
+			if (pdev != NULL) {
+				pdev->coded_phy = entry->coded_phy;
+			}
+		}
+
+		/* Free the entry */
+		k_free(entry);
+
+		if (dev_idx != DEV_IDX_INVALID) {
+			/* See if we already have an open context for this device (unlikely) */
+			ctx_idx = dev_idx_to_ctx_idx(dev_idx);
+
+			/* If no existing context, try to open one */
+			if (ctx_idx == CTX_IDX_INVALID) {
+				if ((pdev->flags & DEV_FLAG_DATA_READY) == 0) {
+					/* Set the data ready flag for the device */
+					pdev->flags |= DEV_FLAG_DATA_READY;
+
+					/* Schedule the work to start a connection */
+					if (!k_work_delayable_is_pending(&connection_start_work)) {
+						k_work_reschedule(&connection_start_work,
+								  START_DELAY);
+					}
+				}
+			}
+		}
+	}
+
+	/* Release the mutex */
+	k_mutex_unlock(&proxy_mutex);
 }
 
 /** @brief Work handler function for starting connections
