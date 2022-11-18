@@ -49,6 +49,11 @@ LOG_MODULE_REGISTER(lcz_lwm2m_ble_central, CONFIG_LCZ_LWM2M_CLIENT_LOG_LEVEL);
 #include <lcz_pki_auth_smp.h>
 #endif
 
+#if defined(CONFIG_LCZ_LWM2M_GATEWAY_PROXY_LED)
+#include <lcz_led.h>
+#include <led_config.h>
+#endif
+
 #include "lcz_lwm2m_gateway_proxy.h"
 
 /**************************************************************************************************/
@@ -1623,6 +1628,10 @@ static void bt_connected(struct bt_conn *conn, uint8_t conn_err)
 			scan_start_fn();
 		}
 	} else if (pctx != NULL) {
+#if defined(CONFIG_LCZ_LWM2M_GATEWAY_PROXY_LED)
+		(void)lcz_led_turn_on(BLE_LED);
+#endif
+
 		/* Restart scanning */
 		if (scan_start_fn != NULL) {
 			scan_start_fn();
@@ -1685,6 +1694,10 @@ static void bt_disconnected(struct bt_conn *conn, uint8_t reason)
 	pctx = lcz_lwm2m_gateway_proxy_conn_to_context(conn);
 
 	if (pctx != NULL) {
+#if defined(CONFIG_LCZ_LWM2M_GATEWAY_PROXY_LED)
+		(void)lcz_led_turn_off(BLE_LED);
+#endif
+
 		/* Restart scanning */
 		if (scan_start_fn != NULL) {
 			scan_start_fn();
