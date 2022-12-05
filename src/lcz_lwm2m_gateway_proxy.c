@@ -488,18 +488,23 @@ static enum lwm2m_coap_resp handle_registration_update(struct lwm2m_ctx *client_
 				}
 			}
 
-			/* Extract CoreLnk string from the body of the POST */
-			corelnk = coap_packet_get_payload(request, &corelnk_len);
-			if (corelnk != NULL && corelnk_len > 0) {
-				lcz_lwm2m_gw_obj_set_object_list(pctx->dev_idx, (char *)corelnk,
-								 corelnk_len);
-			}
-
 			/* Update the expiration time for the device */
 			lcz_lwm2m_gw_obj_tick(pctx->dev_idx);
 
 			/* "Changed" is the correct response */
 			ack->data[COAP_REPLY_BYTE] = COAP_RESPONSE_CODE_CHANGED;
+
+			/* Extract CoreLnk string from the body of the POST */
+			corelnk = coap_packet_get_payload(request, &corelnk_len);
+			if (corelnk != NULL && corelnk_len > 0) {
+				lcz_lwm2m_gw_obj_set_object_list(pctx->dev_idx, (char *)corelnk,
+								 corelnk_len);
+			} else if (lcz_lwm2m_gw_obj_get_object_list_length(pctx->dev_idx) == 0) {
+				/* The CoreLnk string is only sent when it changes.
+				 * If the object list isn't in the database, then return "Not found" to request it.
+				 */
+				ack->data[COAP_REPLY_BYTE] = COAP_RESPONSE_CODE_NOT_FOUND;
+			}
 		} else {
 			/* Prefix was invalid. Return "Not found" */
 			ack->data[COAP_REPLY_BYTE] = COAP_RESPONSE_CODE_NOT_FOUND;
