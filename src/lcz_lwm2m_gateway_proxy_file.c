@@ -190,6 +190,7 @@ static void coap_file_proxy_start(void)
 
 	/* Initialize the transport */
 	memset(&coap_file_proxy_ctx, 0, sizeof(coap_file_proxy_ctx));
+	coap_file_proxy_ctx.sock_fd = -1;
 	coap_file_proxy_ctx.transport_name = "udp";
 	coap_file_proxy_ctx.load_credentials = lcz_lwm2m_fw_update_load_certs;
 	coap_file_proxy_ctx.tls_tag = CONFIG_LCZ_LWM2M_GATEWAY_PROXY_COAP_FILE_TLS_TAG;
@@ -458,7 +459,7 @@ static enum lwm2m_coap_resp service_request(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx,
 	}
 
 	/* Reject if the offset is beyond the end of the file */
-	if (ret == LWM2M_COAP_RESP_NONE && offset >= entry->file_size) {
+	if (ret == LWM2M_COAP_RESP_NONE && entry->file_size > 0 && offset >= entry->file_size) {
 		LOG_ERR("Proxy block request offset (%d) is beyond file length (%d)", offset,
 			entry->file_size);
 		ack->data[COAP_REPLY_BYTE] = COAP_RESPONSE_CODE_BAD_REQUEST;
