@@ -78,6 +78,11 @@ struct queue_entry_t {
 	BT_CONN_LE_CREATE_PARAM(BT_CONN_LE_OPT_CODED | BT_CONN_LE_OPT_NO_1M,                       \
 				BT_GAP_SCAN_FAST_INTERVAL, BT_GAP_SCAN_FAST_INTERVAL)
 
+static struct k_work_queue_config smp_work_q_config = {
+	.name = "smp_work_q",
+	.no_yield = true,
+};
+
 /**************************************************************************************************/
 /* Local Function Prototypes                                                                      */
 /**************************************************************************************************/
@@ -99,9 +104,11 @@ static char *lwm2m_transport_ble_central_print_addr(struct lwm2m_ctx *client_ctx
 						    const struct sockaddr *addr);
 
 static void smp_client_send_work_function(struct k_work *w);
+static void smp_client_receive_work_function(struct k_work *w);
 static void smp_client_send_open_tunnel(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx);
 static void smp_client_resp_handler(struct bt_dfu_smp *dfu_smp);
 static void dfu_smp_on_error(struct bt_dfu_smp *dfu_smp, int err);
+static int handle_smp_message(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx, struct lwm2m_gw_smp_buffer *buf);
 
 static int add_to_queue(struct k_fifo *queue, uint8_t *data, size_t len);
 
@@ -123,6 +130,9 @@ static void auth_complete_cb(const bt_addr_le_t *addr, bool status);
 /**************************************************************************************************/
 /* Local Data Definitions                                                                         */
 /**************************************************************************************************/
+static struct k_work_q smp_work_q;
+static K_THREAD_STACK_DEFINE(smp_work_q_stack, CONFIG_LCZ_LWM2M_GATEWAY_SMP_THREAD_STACK_SIZE);
+
 static const struct lwm2m_transport_procedure ble_central_transport = {
 	.setup = lwm2m_transport_ble_central_setup,
 	.open = lwm2m_transport_ble_central_open,
@@ -291,8 +301,9 @@ static int lwm2m_transport_ble_central_start(struct lwm2m_ctx *client_ctx)
 		CONTAINER_OF(client_ctx, LCZ_LWM2M_GATEWAY_PROXY_CTX_T, ctx);
 	int err;
 
-	/* Initialize the work item */
+	/* Initialize the work items */
 	k_work_init(&(pctx->tunnel_tx_work), smp_client_send_work_function);
+	k_work_init(&(pctx->smp_rx_work), smp_client_receive_work_function);
 
 	/* Initialize the mutex */
 	k_mutex_init(&(pctx->lock));
@@ -300,6 +311,7 @@ static int lwm2m_transport_ble_central_start(struct lwm2m_ctx *client_ctx)
 	/* Initialize our receive and transmit queues */
 	k_fifo_init(&(pctx->rx_queue));
 	k_fifo_init(&(pctx->tx_queue));
+	k_fifo_init(&(pctx->smp_rx_queue));
 
 	/* Initialize the SMP Client */
 	memset(&(pctx->smp_client), 0, sizeof(pctx->smp_client));
@@ -404,7 +416,7 @@ static int lwm2m_transport_ble_central_send(struct lwm2m_ctx *client_ctx, const 
 	if (rc == 0 &&
 	    (pctx->flags & (CTX_FLAG_CLIENT_TUNNEL_OPEN | CTX_FLAG_CLIENT_TUNNEL_BUSY)) ==
 		    CTX_FLAG_CLIENT_TUNNEL_OPEN) {
-		k_work_submit(&(pctx->tunnel_tx_work));
+		k_work_submit_to_queue(&smp_work_q, &(pctx->tunnel_tx_work));
 	}
 
 	/* Else, wait until the tunnel is open or not busy to send */
@@ -893,6 +905,75 @@ static void smp_client_send_work_function(struct k_work *w)
 	}
 }
 
+/** @brief Process received SMP messages from our queue
+ *
+ * Received SMP replies and notifications are queued from the context of the
+ * BT RX thread. The processing of the messages, which can be time-consuming if
+ * they involve decryption, is deferred to this work function.
+ *
+ * @param[in] w Work item pointer
+ */
+static void smp_client_receive_work_function(struct k_work *w)
+{
+	LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx =
+		CONTAINER_OF(w, LCZ_LWM2M_GATEWAY_PROXY_CTX_T, smp_rx_work);
+	int err = 0;
+	struct lwm2m_gw_smp_buffer_queue *item;
+
+	/* Acquire a mutex lock for our data */
+	k_mutex_lock(&(pctx->lock), K_FOREVER);
+
+	/* Remove the first item from the SMP receive queue */
+	item = k_fifo_get(&(pctx->smp_rx_queue), K_NO_WAIT);
+	if (item != NULL) {
+		/* Handle the write response */
+		if (item->buf.header.op == MGMT_OP_WRITE_RSP) {
+			/* Process the recevied message */
+			err = handle_smp_message(pctx, &(item->buf));
+
+			/* Our SMP command is complete. Client tunnel is no longer busy. */
+			pctx->flags &= ~CTX_FLAG_CLIENT_TUNNEL_BUSY;
+
+			/* Check to see if we have more data to send */
+			if (!k_fifo_is_empty(&(pctx->tx_queue))) {
+				k_work_submit_to_queue(&smp_work_q, &(pctx->tunnel_tx_work));
+			}
+		}
+
+		/* Handle the notification */
+		else if (item->buf.header.op == LCZ_COAP_MGMT_OP_NOTIFY) {
+			/* Process the recevied message */
+			err = handle_smp_message(pctx, &(item->buf));
+		}
+
+		/* Any other operations are errors */
+		else {
+			LOG_ERR("Invalid SMP operation %d", item->buf.header.op);
+			err = -EINVAL;
+		}
+
+		/* Free the queue entry */
+		k_free(item);
+	}
+
+	/* Re-submit this work if more messages are in the queue */
+	if (!k_fifo_is_empty(&(pctx->smp_rx_queue))) {
+		k_work_submit_to_queue(&smp_work_q, &(pctx->smp_rx_work));
+	}
+
+	/* Release the mutex lock for our data */
+	k_mutex_unlock(&(pctx->lock));
+
+	/* Report any errors */
+	if (err) {
+		dev_error(pctx, false);
+
+		if (pctx->ctx.fault_cb != NULL) {
+			pctx->ctx.fault_cb(&(pctx->ctx), err);
+		}
+	}
+}
+
 /** @brief Send an Open Tunnel message to the peripheral
  *
  * This function builds the CBOR and SMP message for the Open Tunnel message and
@@ -1364,19 +1445,19 @@ static int handle_tunnel_enc_data_resp(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx, zcbo
  *
  * @returns 0 on success, <0 on error.
  */
-static int handle_smp_message(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx)
+static int handle_smp_message(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx, struct lwm2m_gw_smp_buffer *buf)
 {
-	uint16_t payload_len = ((uint16_t)pctx->smp_rsp_buff->header.len_h8) << 8 |
-			       pctx->smp_rsp_buff->header.len_l8;
+	uint16_t payload_len = ((uint16_t)buf->header.len_h8) << 8 |
+			       buf->header.len_l8;
 	int err = -EINVAL;
 	zcbor_state_t states[CONFIG_MGMT_MAX_DECODING_LEVELS + 2];
 
 	/* Initialize the CBOR reader */
-	zcbor_new_state(states, sizeof(states) / sizeof(zcbor_state_t), pctx->smp_rsp_buff->payload,
+	zcbor_new_state(states, sizeof(states) / sizeof(zcbor_state_t), buf->payload,
 			payload_len, 1);
 
-	if (pctx->smp_rsp_buff->header.op == MGMT_OP_WRITE_RSP) {
-		switch (pctx->smp_rsp_buff->header.id) {
+	if (buf->header.op == MGMT_OP_WRITE_RSP) {
+		switch (buf->header.id) {
 		case LCZ_COAP_MGMT_ID_OPEN_TUNNEL:
 			err = handle_open_tunnel_resp(pctx, states);
 			break;
@@ -1392,11 +1473,11 @@ static int handle_smp_message(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx)
 			break;
 #endif
 		default:
-			LOG_ERR("Unknown SMP write response ID %d", pctx->smp_rsp_buff->header.id);
+			LOG_ERR("Unknown SMP write response ID %d", buf->header.id);
 			break;
 		}
-	} else if (pctx->smp_rsp_buff->header.op == LCZ_COAP_MGMT_OP_NOTIFY) {
-		switch (pctx->smp_rsp_buff->header.id) {
+	} else if (buf->header.op == LCZ_COAP_MGMT_OP_NOTIFY) {
+		switch (buf->header.id) {
 		case LCZ_COAP_MGMT_ID_TUNNEL_DATA:
 			err = handle_tunnel_data(pctx, states);
 			break;
@@ -1406,7 +1487,7 @@ static int handle_smp_message(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx)
 			break;
 #endif
 		default:
-			LOG_ERR("Unknown SMP notify ID %d", pctx->smp_rsp_buff->header.id);
+			LOG_ERR("Unknown SMP notify ID %d", buf->header.id);
 			break;
 		}
 	}
@@ -1443,8 +1524,8 @@ static void smp_client_resp_handler(struct bt_dfu_smp *dfu_smp)
 			err = -EINVAL;
 		}
 		if (err == 0) {
-			pctx->smp_rsp_buff = (struct lwm2m_gw_smp_buffer *)k_malloc(
-				CONFIG_LCZ_LWM2M_TRANSPORT_BLE_MAX_PACKET);
+			pctx->smp_rsp_buff = (struct lwm2m_gw_smp_buffer_queue *)k_malloc(
+				sizeof(void *) + CONFIG_LCZ_LWM2M_TRANSPORT_BLE_MAX_PACKET);
 			if (pctx->smp_rsp_buff == NULL) {
 				LOG_ERR("smp_client_resp_handler: Could not allocate reassembly buffer");
 				err = -ENOMEM;
@@ -1454,7 +1535,7 @@ static void smp_client_resp_handler(struct bt_dfu_smp *dfu_smp)
 
 	/* Copy the new data in our response buffer */
 	if (err == 0) {
-		p_outdata = (uint8_t *)pctx->smp_rsp_buff;
+		p_outdata = (uint8_t *)&(pctx->smp_rsp_buff->buf);
 		if (rsp_state->offset + rsp_state->chunk_size >
 		    CONFIG_LCZ_LWM2M_TRANSPORT_BLE_MAX_PACKET) {
 			LOG_ERR("smp_client_resp_handler: Reassembly buffer overflow");
@@ -1475,42 +1556,24 @@ static void smp_client_resp_handler(struct bt_dfu_smp *dfu_smp)
 
 	/* Verify the group ID in the message */
 	if (err == 0) {
-		uint16_t group = ((uint16_t)pctx->smp_rsp_buff->header.group_h8) << 8 |
-				 pctx->smp_rsp_buff->header.group_l8;
+		uint16_t group = ((uint16_t)pctx->smp_rsp_buff->buf.header.group_h8) << 8 |
+				 pctx->smp_rsp_buff->buf.header.group_l8;
 		if (group != CONFIG_LCZ_LWM2M_TRANSPORT_BLE_SMP_GROUP) {
 			LOG_ERR("SMP response has wrong group");
 			err = -EINVAL;
 		}
 	}
 
-	/* Handle the write response */
-	if (err == 0 && pctx->smp_rsp_buff->header.op == MGMT_OP_WRITE_RSP) {
-		/* Process the recevied message */
-		err = handle_smp_message(pctx);
+	/* If we're done, queue the message for later processing */
+	if (err == 0) {
+		/* Add the buffer to the SMP RX FIFO */
+		k_fifo_put(&(pctx->smp_rx_queue), pctx->smp_rsp_buff);
+		pctx->smp_rsp_buff = NULL;
 
-		/* Our SMP command is complete. Client tunnel is no longer busy. */
-		pctx->flags &= ~CTX_FLAG_CLIENT_TUNNEL_BUSY;
-
-		/* Check to see if we have more data to send */
-		if (!k_fifo_is_empty(&(pctx->tx_queue))) {
-			k_work_submit(&(pctx->tunnel_tx_work));
-		}
-	}
-
-	/* Handle the notification */
-	else if (err == 0 && pctx->smp_rsp_buff->header.op == LCZ_COAP_MGMT_OP_NOTIFY) {
-		/* Process the recevied message */
-		err = handle_smp_message(pctx);
-	}
-
-	/* Any other operations are errors */
-	else if (err == 0) {
-		LOG_ERR("Invalid SMP operation %d", pctx->smp_rsp_buff->header.op);
-		err = -EINVAL;
-	}
-
-	/* Free the reassembly buffer */
-	if ((err != -EAGAIN) && (pctx->smp_rsp_buff != NULL)) {
+		/* Schedule the work handler to run to process the message */
+		k_work_submit_to_queue(&smp_work_q, &(pctx->smp_rx_work));
+	} else if ((err != -EAGAIN) && (pctx->smp_rsp_buff != NULL)) {
+		/* Free the reassembly buffer */
 		k_free(pctx->smp_rsp_buff);
 		pctx->smp_rsp_buff = NULL;
 	}
@@ -1896,7 +1959,7 @@ static void auth_complete_cb(const bt_addr_le_t *addr, bool status)
 	if (pctx != NULL) {
 		if (status) {
 			pctx->flags |= CTX_FLAG_CLIENT_AUTHORIZED;
-			k_work_submit(&(pctx->tunnel_tx_work));
+			k_work_submit_to_queue(&smp_work_q, &(pctx->tunnel_tx_work));
 		} else if (auth_required == true) {
 #if defined(CONFIG_LCZ_PKI_AUTH_SMP_CENTRAL)
 			LOG_ERR("The SMP authentication procedure failed");
@@ -1914,7 +1977,7 @@ static void auth_complete_cb(const bt_addr_le_t *addr, bool status)
 #if defined(CONFIG_LCZ_PKI_AUTH_SMP_CENTRAL)
 			LOG_WRN("SMP authentication failed, but was not required");
 #endif
-			k_work_submit(&(pctx->tunnel_tx_work));
+			k_work_submit_to_queue(&smp_work_q, &(pctx->tunnel_tx_work));
 		}
 	}
 }
@@ -1927,6 +1990,11 @@ static int lcz_lwm2m_transport_ble_central_init(const struct device *dev)
 {
 	ARG_UNUSED(dev);
 	int err;
+
+	/* Create our work queue */
+	k_work_queue_init(&smp_work_q);
+	k_work_queue_start(&smp_work_q, smp_work_q_stack, K_THREAD_STACK_SIZEOF(smp_work_q_stack),
+			   CONFIG_LCZ_LWM2M_GATEWAY_SMP_THREAD_PRIORITY, &smp_work_q_config);
 
 	/* Register for BT callbacks */
 	bt_conn_cb_register(&conn_callbacks);

@@ -49,6 +49,12 @@ struct lwm2m_gw_smp_buffer {
 	uint8_t payload[1];
 };
 
+/* Queue entry for SMP receive queue */
+struct lwm2m_gw_smp_buffer_queue {
+	void *fifo_reserved;
+	struct lwm2m_gw_smp_buffer buf;
+};
+
 /** @brief Data strorage for proxy device information */
 typedef struct {
 	/* SMP transport tunnel ID */
@@ -88,7 +94,9 @@ typedef struct {
 	struct bt_conn *active_conn;
 
 	/* Buffer to hold SMP messages (replies and notifications) to be re-assembled */
-	struct lwm2m_gw_smp_buffer *smp_rsp_buff;
+	struct lwm2m_gw_smp_buffer_queue *smp_rsp_buff;
+	struct k_fifo smp_rx_queue;
+	struct k_work smp_rx_work;
 
 	/* Pending messages from the device */
 	struct coap_pending pendings[CONFIG_LWM2M_ENGINE_MAX_PENDING];

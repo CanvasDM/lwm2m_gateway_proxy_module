@@ -39,7 +39,7 @@ LOG_MODULE_REGISTER(lcz_lwm2m_gateway_proxy_file, CONFIG_LCZ_LWM2M_GATEWAY_PROXY
 #define COAP_RETRIES_INIT 1
 
 typedef struct {
-	uint8_t *uri;
+	char *uri;
 	int64_t time_added;
 	char file_path[CONFIG_FSU_MAX_FILE_NAME_SIZE];
 	uint32_t file_size;
@@ -106,7 +106,7 @@ enum lwm2m_coap_resp lcz_lwm2m_gateway_file_proxy_request(LCZ_LWM2M_GATEWAY_PROX
 							  struct coap_packet *ack)
 {
 	PROXY_CACHE_ENTRY_T *entry;
-	uint8_t uri[CONFIG_LWM2M_SWMGMT_PACKAGE_URI_LEN];
+	char uri[CONFIG_LWM2M_SWMGMT_PACKAGE_URI_LEN];
 	enum lwm2m_coap_resp ret = LWM2M_COAP_RESP_NONE;
 
 	if (lcz_coap_find_proxy_uri(request, uri, sizeof(uri)) == false) {

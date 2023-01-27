@@ -26,6 +26,14 @@ config LCZ_LWM2M_GATEWAY_PROXY_INIT_PRIORITY
 	range 0 99
 	default APPLICATION_INIT_PRIORITY
 
+config LCZ_LWM2M_GATEWAY_SMP_THREAD_STACK_SIZE
+	int "Stack size for SMP work queue thread"
+	default 1536
+
+config LCZ_LWM2M_GATEWAY_SMP_THREAD_PRIORITY
+	int "Priority of SMP work queue thread"
+	default 0
+
 config LCZ_LWM2M_GATEWAY_PROXY_NUM_CONTEXTS
 	int "Number of simultaneous proxy client connections"
 	range 1 BT_MAX_CONN
