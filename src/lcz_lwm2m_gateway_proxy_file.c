@@ -111,7 +111,7 @@ enum lwm2m_coap_resp lcz_lwm2m_gateway_file_proxy_request(LCZ_LWM2M_GATEWAY_PROX
 
 	if (lcz_coap_find_proxy_uri(request, uri, sizeof(uri)) == false) {
 		/* Should never happen */
-		LOG_ERR("File proxy request recevied without proxy URI");
+		LOG_ERR("File proxy request received without proxy URI");
 	} else {
 		/* Acquire a lock for our data */
 		k_mutex_lock(&file_proxy_mutex, K_FOREVER);
