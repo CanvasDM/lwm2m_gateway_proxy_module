@@ -619,9 +619,7 @@ static int build_tunnel_data(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx,
 	out_buffer_size =
 		sizeof(struct bt_dfu_smp_header) + LCZ_COAP_TUNNEL_CBOR_OVERHEAD + item_len;
 	if (out_buffer_size > CONFIG_LCZ_LWM2M_TRANSPORT_BLE_MAX_PACKET) {
-		item_len = item_len - (out_buffer_size - CONFIG_LCZ_LWM2M_TRANSPORT_BLE_MAX_PACKET);
-		out_buffer_size =
-			sizeof(struct bt_dfu_smp_header) + LCZ_COAP_TUNNEL_CBOR_OVERHEAD + item_len;
+		LOG_WRN("Packet too big (%d), item size: %d", out_buffer_size, item_len);
 	}
 
 	/* Allocate memory for the message */
@@ -734,13 +732,7 @@ static int build_tunnel_enc_data(LCZ_LWM2M_GATEWAY_PROXY_CTX_T *pctx,
 	out_buffer_size =
 		sizeof(struct bt_dfu_smp_header) + LCZ_COAP_TUNNEL_CBOR_OVERHEAD + ciphertext_size;
 	if (out_buffer_size > CONFIG_LCZ_LWM2M_TRANSPORT_BLE_MAX_PACKET) {
-		item_len = item_len - (out_buffer_size - CONFIG_LCZ_LWM2M_TRANSPORT_BLE_MAX_PACKET);
-		ciphertext_size =
-			nonce_len + PSA_AEAD_ENCRYPT_OUTPUT_SIZE(
-					    LCZ_PKI_AUTH_SMP_SESSION_KEY_TYPE,
-					    LCZ_PKI_AUTH_SMP_SESSION_AEAD_KEY_ALG, item_len);
-		out_buffer_size = sizeof(struct bt_dfu_smp_header) + LCZ_COAP_TUNNEL_CBOR_OVERHEAD +
-				  ciphertext_size;
+		LOG_WRN("Packet too big (%d), item size: %d", out_buffer_size, item_len);
 	}
 
 	/* Allocate memory for the message */
